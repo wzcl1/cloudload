@@ -1,0 +1,16 @@
+services:
+  cloudload:
+    build: .
+    image: cloudload-proxy:latest
+    container_name: cloudload
+    ports:
+      - "8080:8080"
+    environment:
+      - LISTEN_PORT=8080
+      - YTDLP=yt-dlp
+      # Set both to enable basic auth (leave empty to disable):
+      - BASIC_AUTH_USER=
+      - BASIC_AUTH_PASS=
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
