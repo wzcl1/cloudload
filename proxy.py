@@ -2150,7 +2150,8 @@ async function refresh() {
       if (d.status === 'downloading' || d.status === 'queued') {
         actions = '<button data-id="' + id + '" onclick="cancelDl(this)">Cancel</button>';
       } else if (d.status === 'done') {
-        actions = '<a class="btn" href="/api/file/' + id + '">Save file</a>' +
+        actions = '<a class="btn" href="/player?id=' + id + '">Play</a>' +
+                  '<a class="btn" href="/api/file/' + id + '">Save</a>' +
                   '<button class="del" data-id="' + id + '" onclick="deleteDl(this)">Delete</button>';
       } else if (d.status === 'interrupted' || d.status === 'error' || d.status === 'cancelled') {
         if (d.resumable) {
@@ -2178,6 +2179,149 @@ async function refresh() {
 
 refresh();
 </script>
+</body>
+</html>
+"""
+
+
+# ── Player pages ─────────────────────────────────────────────────────────────
+
+def render_player_library():
+    """Grid view of all completed downloads with playable video files."""
+    with download_lock:
+        entries = {k: dict(v) for k, v in downloads.items()}
+    # Only completed downloads with files
+    videos = []
+    for dl_id, d in entries.items():
+        if d.get("status") != "done" or not d.get("file") or not os.path.exists(d["file"]):
+            continue
+        videos.append({
+            "id": dl_id,
+            "title": d.get("title", "video"),
+            "code": d.get("code", ""),
+            "provider": d.get("provider", ""),
+            "size": os.path.getsize(d["file"]),
+            "filename": os.path.basename(d["file"]),
+        })
+    videos.sort(key=lambda v: v["title"])
+
+    rows = []
+    for v in videos:
+        size_mb = v["size"] / 1048576
+        if size_mb >= 1:
+            size_str = f"{size_mb:.0f} MB"
+        else:
+            size_str = f"{v['size'] / 1024:.0f} KB"
+        code_label = html.escape(v["code"]) if v["code"] else ""
+        rows.append(
+            f'<div class="card" onclick="location.href=\'/player?id={v["id"]}\'"'
+            f' title="{html.escape(v["title"])}">'
+            f'  <div class="thumb">'
+            f'    <svg viewBox="0 0 24 24" fill="#e94560" width="48" height="48">'
+            f'      <path d="M8 5v14l11-7z"/>'
+            f'    </svg>'
+            f'  </div>'
+            f'  <div class="info">'
+            f'    <div class="vtitle">{html.escape(v["title"])}</div>'
+            f'    <div class="meta">{code_label} &middot; {size_str}</div>'
+            f'  </div>'
+            f'</div>'
+        )
+
+    if not rows:
+        grid = '<div class="empty">No completed downloads to play.</div>'
+    else:
+        grid = '<div class="grid">' + "\n".join(rows) + '</div>'
+
+    return PLAYER_LIBRARY_PAGE.replace("__GRID__", grid).replace(
+        "__COUNT__", str(len(videos)))
+
+
+PLAYER_LIBRARY_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Player - JavProxy</title>
+<style>
+body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:20px; }
+h1 { color:#e94560; font-size:20px; margin:0 0 16px 0; }
+h1 a { color:#2196f3; font-size:13px; font-weight:normal; text-decoration:none; margin-left:10px; }
+h1 a:hover { text-decoration:underline; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:16px; }
+.card {
+    background:#16213e; border:1px solid #0f3460; border-radius:10px;
+    overflow:hidden; cursor:pointer; transition:border-color .15s, transform .15s;
+}
+.card:hover { border-color:#e94560; transform:translateY(-2px); }
+.thumb {
+    display:flex; align-items:center; justify-content:center;
+    height:120px; background:#0f0f1a;
+}
+.info { padding:10px 12px; }
+.vtitle {
+    color:#ccc; font-size:13px; font-weight:bold;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.meta { color:#888; font-size:11px; margin-top:4px; }
+.empty { color:#555; font-size:14px; margin-top:40px; text-align:center; }
+</style>
+</head>
+<body>
+<h1>Player <a href="/downloads">Downloads</a></h1>
+<div style="color:#888;font-size:12px;margin-bottom:16px;">__COUNT__ video(s) ready</div>
+__GRID__
+</body>
+</html>
+"""
+
+
+def render_player_page(dl_id):
+    """Single-video player page."""
+    with download_lock:
+        info = downloads.get(dl_id, {})
+    if info.get("status") != "done" or not info.get("file") or not os.path.exists(info["file"]):
+        return None
+
+    title = html.escape(info.get("title", "Video"))
+    code = html.escape(info.get("code", ""))
+    file_url = f"/api/file/{dl_id}"
+
+    return PLAYER_VIDEO_PAGE.replace("__TITLE__", title).replace(
+        "__CODE__", code).replace("__FILE_URL__", file_url).replace(
+        "__DL_ID__", dl_id)
+
+
+PLAYER_VIDEO_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ - Player</title>
+<style>
+body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:0; }
+.topbar {
+    display:flex; align-items:center; gap:12px; padding:12px 20px;
+    background:#16213e; border-bottom:1px solid #0f3460;
+}
+.topbar a { color:#2196f3; font-size:13px; text-decoration:none; }
+.topbar a:hover { text-decoration:underline; }
+.topbar .title { color:#ccc; font-size:14px; font-weight:bold; flex:1;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.topbar .code { color:#888; font-size:12px; }
+.player { width:100%; max-height:calc(100vh - 50px); background:#000; }
+</style>
+</head>
+<body>
+<div class="topbar">
+    <a href="/player">&larr; Library</a>
+    <span class="title">__TITLE__</span>
+    <span class="code">__CODE__</span>
+</div>
+<video class="player" controls autoplay>
+    <source src="__FILE_URL__">
+    Your browser does not support the video tag.
+</video>
 </body>
 </html>
 """
@@ -2259,7 +2403,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, info)
             return
 
-        # ── API: Serve downloaded file ──
+        # ── API: Serve downloaded file (with range request support) ──
         if path.startswith("/api/file/"):
             dl_id = path.split("/")[-1]
             with download_lock:
@@ -2267,11 +2411,43 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             file_path = info.get("file")
             if file_path and os.path.exists(file_path):
                 filename = os.path.basename(file_path)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 file_size = os.path.getsize(file_path)
+                # Determine MIME type
+                ext = os.path.splitext(filename)[1].lower()
+                mime = {".mp4": "video/mp4", ".webm": "video/webm",
+                        ".mkv": "video/x-matroska", ".ts": "video/mp2t",
+                        ".avi": "video/x-msvideo", ".mov": "video/quicktime"}.get(ext, "application/octet-stream")
+
+                range_header = self.headers.get("Range")
+                if range_header:
+                    # Parse Range: bytes=start-end
+                    m = re.match(r"bytes=(\d+)-(\d*)", range_header)
+                    if m:
+                        start = int(m.group(1))
+                        end = int(m.group(2)) if m.group(2) else file_size - 1
+                        end = min(end, file_size - 1)
+                        length = end - start + 1
+                        self.send_response(206)
+                        self.send_header("Content-Type", mime)
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                        self.send_header("Content-Length", str(length))
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.end_headers()
+                        with open(file_path, "rb") as f:
+                            f.seek(start)
+                            remaining = length
+                            while remaining > 0:
+                                chunk = f.read(min(65536, remaining))
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
+                                remaining -= len(chunk)
+                        return
+
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
                 self.send_header("Content-Length", str(file_size))
+                self.send_header("Accept-Ranges", "bytes")
                 self.end_headers()
                 with open(file_path, "rb") as f:
                     shutil.copyfileobj(f, self.wfile)
@@ -2305,6 +2481,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # ── Download log page ──
         if path == "/log":
             body = render_log_page().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # ── Player: library or single video ──
+        if path == "/player":
+            params = urllib.parse.parse_qs(query)
+            dl_id = params.get("id", [None])[0]
+            if dl_id:
+                body = render_player_page(dl_id)
+                if body is None:
+                    self.send_error(404, "Video not found")
+                    return
+            else:
+                body = render_player_library()
+            body = body.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
