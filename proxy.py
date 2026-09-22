@@ -38,6 +38,11 @@ BASIC_AUTH_PASS = os.environ.get("BASIC_AUTH_PASS", "")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# ── supjav.com (Cloudflare-gated) ────────────────────────────────────────────
+SUPJAV_BASE = "https://supjav.com"
+SUPJAV_PREFIX = "/supjav"
+CF_COOKIE_FILE = os.path.join(DOWNLOAD_DIR, "supjav_cf.json")
+
 # Track active downloads: {id: {status, progress, file, title, error}}
 downloads = {}
 download_lock = threading.Lock()
@@ -683,6 +688,225 @@ def fetch_url_full(url, referer=None, timeout=20):
             return body, resp.geturl()
     except Exception:
         return None, url
+
+
+# ── supjav.com (Cloudflare-gated) support ────────────────────────────────────
+#
+# supjav.com sits behind a Cloudflare *managed* challenge, which plain HTTP
+# clients (urllib/curl) cannot pass. The bypass is a `cf_clearance` cookie that
+# the user's own browser earns by solving the challenge interactively. The
+# cookie is bound to (public IP, User-Agent), so it only works when the proxy
+# server and the user's browser share a public IP (e.g. a home server behind
+# the same NAT). The cookie is stored on disk and attached to every upstream
+# supjav request.
+
+cf_lock = threading.Lock()
+
+
+def load_cf_cookie():
+    """Read the stored cf_clearance cookie. Returns {cf_clearance, user_agent} or {}."""
+    try:
+        with open(CF_COOKIE_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("cf_clearance"):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_cf_cookie(cf_clearance, user_agent=""):
+    """Persist the cf_clearance cookie + the UA that earned it."""
+    with cf_lock:
+        data = {"cf_clearance": cf_clearance, "user_agent": user_agent or ""}
+        tmp = CF_COOKIE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, CF_COOKIE_FILE)
+    return data
+
+
+def _cf_cookie_and_ua():
+    """Return (Cookie header value or None, user-agent or None)."""
+    data = load_cf_cookie()
+    if not data.get("cf_clearance"):
+        return None, None
+    return f"cf_clearance={data['cf_clearance']}", (data.get("user_agent") or None)
+
+
+def _is_cf_challenge(status, headers, text):
+    """True if the response is a Cloudflare interstitial (not real content)."""
+    if headers.get("cf-mitigated", "").lower() == "challenge":
+        return True
+    if status in (403, 503) and "Just a moment" in text and "challenges.cloudflare.com" in text:
+        return True
+    return False
+
+
+def fetch_supjav(path, referer=None, timeout=20):
+    """Fetch a supjav.com URL, attaching the stored cf_clearance cookie.
+
+    Follows redirects and captures 4xx/5xx (a CF challenge is a 403) so we can
+    detect it. Returns a dict:
+      ok        True if a real (non-challenge) page was fetched
+      status    HTTP status code (0 on transport error)
+      challenge True if the response was a Cloudflare challenge page
+      body      response body as str ("" on transport error)
+      final_url URL after redirects
+    """
+    url = SUPJAV_BASE + path
+    cookie, ua = _cf_cookie_and_ua()
+    headers = {
+        "User-Agent": ua or _BROWSERS_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        status, hdrs, body, final_url = resp.getcode(), resp.headers, resp.read(), resp.geturl()
+    except urllib.error.HTTPError as e:
+        status, hdrs, body, final_url = e.code, e.headers, e.read(), url
+    except Exception:
+        return {"ok": False, "status": 0, "challenge": False, "body": "", "final_url": url}
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        text = body.decode("latin-1")
+    challenge = _is_cf_challenge(status, hdrs, text)
+    return {"ok": (not challenge and status == 200 and bool(text)),
+            "status": status, "challenge": challenge, "body": text, "final_url": final_url}
+
+
+def _rewrite_supjav_urls(content):
+    """Rewrite supjav.com page markup so it renders through the proxy.
+
+    - supjav.com absolute hrefs  -> /supjav/...   (proxied page)
+    - external asset src=        -> /ext/<host>/...  (proxied asset)
+    """
+    content = re.sub(
+        r"""(href|action)=(['"])https?://(?:www\.)?supjav\.com""",
+        lambda m: f'{m.group(1)}={m.group(2)}{SUPJAV_PREFIX}',
+        content
+    )
+    # Proxy external assets (images/css/js/fonts/video) so the page renders
+    # without the browser hitting Cloudflare-gated origins directly. Matches
+    # both absolute (https://host) and protocol-relative (//host) URLs.
+    content = re.sub(
+        r"""(src)=(['"])(?:https?:)?//([^/'"]+)""",
+        lambda m: (f'{m.group(1)}={m.group(2)}/ext/{m.group(3)}'
+                   if m.group(3).lower() not in ("supjav.com", "www.supjav.com")
+                   else m.group(0)),
+        content
+    )
+    return content
+
+
+def rewrite_supjav_page(content, page_url=""):
+    """Ad-strip a supjav.com page and rewrite its links/assets for the proxy.
+
+    - supjav.com absolute links -> /supjav/...
+    - external assets (src=)    -> /ext/<host>/...
+    - same-origin relative links -> /supjav/... (never re-prefixing routes that
+      are already absolute proxy paths)
+    """
+    content = strip_ads_from_html(content, page_url)
+    content = _rewrite_supjav_urls(content)
+    content = re.sub(
+        r"""(href|src|action)=(['"])(/[^'"]+)\2""",
+        lambda m: (m.group(0) if m.group(3).startswith(
+            ("/supjav", "/ext/", "/api/", "/cdn/", "/downloads", "/log", "/player"))
+            else f'{m.group(1)}={m.group(2)}{SUPJAV_PREFIX}{m.group(3)}{m.group(2)}'),
+        content
+    )
+    return content
+
+
+SUPJAV_VERIFY_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify with Cloudflare - JavProxy</title>
+<style>
+body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:30px 16px; }
+.wrap { max-width:560px; margin:0 auto; background:#16213e; border:1px solid #0f3460;
+  border-radius:14px; padding:26px 24px; }
+h1 { color:#e94560; font-size:20px; margin:0 0 6px 0; }
+p { color:#bbb; font-size:14px; line-height:1.55; margin:12px 0; }
+.note { background:#3a2a12; border:1px solid #b8860b; color:#ffd27a; border-radius:8px;
+  padding:10px 12px; font-size:13px; }
+.step { display:flex; gap:12px; margin:14px 0; }
+.step .n { flex:0 0 auto; width:26px; height:26px; border-radius:50%; background:#0f3460;
+  color:#e94560; font-weight:bold; display:flex; align-items:center; justify-content:center;
+  font-size:14px; border:1px solid #e94560; }
+.step .t { color:#ccc; font-size:14px; line-height:1.5; padding-top:2px; }
+button, a.btn { display:inline-block; padding:12px 18px; border-radius:8px; border:1px solid #e94560;
+  background:#0f3460; color:#fff; font-size:14px; font-weight:bold; cursor:pointer; text-decoration:none; }
+button:hover, a.btn:hover { background:#16437e; }
+textarea { width:100%; box-sizing:border-box; background:#0f0f1a; color:#eee; border:1px solid #0f3460;
+  border-radius:8px; padding:10px; font-family:monospace; font-size:12px; min-height:74px; resize:vertical; }
+code { background:#0f0f1a; border:1px solid #0f3460; border-radius:4px; padding:1px 5px;
+  font-family:monospace; font-size:12px; color:#9ecbff; word-break:break-all; }
+#status { margin-top:14px; font-size:13px; min-height:18px; }
+#status.ok { color:#4caf50; } #status.err { color:#ff6b6b; } #status.busy { color:#ff9800; }
+.hint { color:#666; font-size:11px; margin-top:16px; line-height:1.5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Verify with Cloudflare</h1>
+  <p>supjav.com is protected by Cloudflare. The proxy can't solve that challenge
+     itself, so your browser does it once, and hands the resulting cookie back to
+     the proxy.</p>
+  __NOTE__
+  <div class="step"><div class="n">1</div><div class="t">
+    Click below and complete the Cloudflare check in the new tab (it usually
+    clears by itself in a few seconds; occasionally a box to tick appears).
+  </div></div>
+  <div style="margin:6px 0 6px 38px;"><a class="btn" href="https://supjav.com/" target="_blank" rel="noopener">Open supjav.com to verify</a></div>
+  <div class="step"><div class="n">2</div><div class="t">
+    Back in that supjav.com tab, open DevTools (F12) &rarr; Console and run
+    <code>copy(document.cookie)</code> to copy the cookies.
+  </div></div>
+  <div class="step"><div class="n">3</div><div class="t">
+    Paste them below and click Save. The proxy keeps the <code>cf_clearance</code>
+    cookie and uses it for all supjav requests.
+  </div></div>
+  <textarea id="cookie" placeholder="Paste the copied cookies here (cf_clearance=... is what's used)"></textarea>
+  <div style="margin-top:12px;"><button id="save" onclick="saveCookie()">Save &amp; verify</button></div>
+  <div id="status"></div>
+  <div class="hint">
+    The cookie is tied to your browser's IP + user-agent and expires every few
+    days. If supjav pages start failing, repeat these steps. The proxy and your
+    browser must share the same public IP (e.g. the same home network).
+  </div>
+</div>
+<script>
+const NEXT = __NEXT__;
+function setStatus(msg, cls) { const s = document.getElementById('status'); s.textContent = msg; s.className = cls || ''; }
+async function saveCookie() {
+  const raw = document.getElementById('cookie').value.trim();
+  const btn = document.getElementById('save');
+  if (!raw) { setStatus('Paste the cookies first.', 'err'); return; }
+  btn.disabled = true; setStatus('Saving and testing against supjav.com...', 'busy');
+  try {
+    const r = await fetch('/api/cf-cookie', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookie: raw }) });
+    const d = await r.json();
+    if (d.error) { setStatus('Error: ' + d.error, 'err'); btn.disabled = false; return; }
+    if (d.ok) { setStatus('Cookie works — loading supjav.com...', 'ok'); setTimeout(() => location.href = NEXT, 400); }
+    else { setStatus('Saved, but it did not pass the challenge (status ' + d.status + '). Make sure you finished the check in step 1, and that this browser shares the proxy public IP.', 'err'); btn.disabled = false; }
+  } catch (e) { setStatus('Request failed: ' + e.message, 'err'); btn.disabled = false; }
+}
+</script>
+</body>
+</html>
+"""
 
 
 def extract_base64_iframe_urls(page_html):
@@ -2353,6 +2577,109 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
+    # ── supjav.com (Cloudflare-gated) handlers ──
+    def _serve_verify_page(self, next_path, note=""):
+        note_html = ""
+        if note:
+            note_html = f'<div class="note" style="margin-bottom:14px;">{html.escape(note)}</div>'
+        page = SUPJAV_VERIFY_PAGE.replace("__NOTE__", note_html).replace(
+            "__NEXT__", json.dumps(next_path))
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_supjav(self, path, query):
+        """Serve a supjav.com page through the proxy, or the verify page if the
+        cf_clearance cookie is missing/expired."""
+        suffix = path[len(SUPJAV_PREFIX):] or "/"
+        if query:
+            suffix += "?" + query
+
+        # No cookie stored at all -> straight to the verify page (no wasted fetch).
+        if not load_cf_cookie().get("cf_clearance"):
+            self._serve_verify_page(suffix)
+            return
+
+        res = fetch_supjav(suffix, referer=SUPJAV_BASE)
+        if res["challenge"]:
+            self._serve_verify_page(suffix, note="Your Cloudflare cookie has expired or is invalid — please re-verify below.")
+            return
+        if not res["ok"] or not res["body"]:
+            self.send_error(502, f"Failed to fetch supjav.com (status {res['status']})")
+            return
+
+        content = rewrite_supjav_page(res["body"], SUPJAV_BASE + suffix)
+        # Inject the nav badge (Downloads + supjav) last, so its own links are
+        # untouched by the rewrites above.
+        content = self._inject_nav_badge(content)
+        body = content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    @staticmethod
+    def _is_blocked_ext_host(host):
+        """Basic SSRF guard for the /ext/ asset proxy."""
+        h = host.lower().split(":")[0]
+        if h in ("localhost", "0.0.0.0", "[::]", "::1", "127.0.0.1"):
+            return True
+        if h.startswith(("10.", "192.168.", "169.254.", "127.")):
+            return True
+        if h.startswith(("172.16.", "172.17.", "172.18.", "172.19.",
+                         "172.20.", "172.21.", "172.22.", "172.23.",
+                         "172.24.", "172.25.", "172.26.", "172.27.",
+                         "172.28.", "172.29.", "172.30.", "172.31.")):
+            return True
+        if h.endswith((".local", ".internal", ".lan")):
+            return True
+        return False
+
+    def _handle_ext_asset(self, path, query):
+        """Generic asset proxy: /ext/<host>/<path> -> https://<host>/<path>."""
+        rest = path[len("/ext/"):]
+        host, _, suffix = rest.partition("/")
+        if not host or self._is_blocked_ext_host(host):
+            self.send_error(404)
+            return
+        real_url = f"https://{host}/{suffix}" + (f"?{query}" if query else "")
+        data, remote_ct = fetch_url_bytes(real_url, referer=SUPJAV_BASE)
+        if data is None:
+            self.send_error(502)
+            return
+        content_type = remote_ct or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _inject_nav_badge(self, content):
+        """Inject a floating nav (Downloads + supjav) before </body>."""
+        badge = (
+            '<div id="javproxy-nav" style="position:fixed;top:10px;left:10px;z-index:1000000;'
+            'display:flex;gap:8px;">'
+            '<a href="/downloads" style="background:#0f3460;color:#fff;border:1px solid #e94560;'
+            'border-radius:16px;padding:6px 14px;font:bold 12px Arial,sans-serif;'
+            'text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,.4);">Downloads</a>'
+            '<a href="/supjav" style="background:#0f3460;color:#fff;border:1px solid #2196f3;'
+            'border-radius:16px;padding:6px 14px;font:bold 12px Arial,sans-serif;'
+            'text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,.4);">supjav</a>'
+            '</div>'
+        )
+        if '</body>' in content:
+            return content.replace('</body>', badge + '\n</body>', 1)
+        return content + badge
+
     def do_GET(self):
         if not self._auth_ok():
             return
@@ -2393,6 +2720,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             result = extract_streams_from_page(url, provider)
             self.send_json(200, result)
+            return
+
+        # ── API: Check whether the stored supjav CF cookie still passes ──
+        if path == "/api/cf-check":
+            if not load_cf_cookie().get("cf_clearance"):
+                self.send_json(200, {"ok": False, "challenge": False, "status": 0,
+                                     "message": "No cookie stored"})
+                return
+            res = fetch_supjav("/", referer=SUPJAV_BASE)
+            self.send_json(200, {
+                "ok": res["ok"], "challenge": res["challenge"], "status": res["status"],
+                "message": "Cookie works" if res["ok"] else "Cookie did not pass the challenge",
+            })
             return
 
         # ── API: Download status ──
@@ -2554,6 +2894,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        # ── supjav.com pages (Cloudflare-gated) ──
+        if path == SUPJAV_PREFIX or path.startswith(SUPJAV_PREFIX + "/"):
+            self._handle_supjav(path, query)
+            return
+
+        # ── Generic external asset proxy (/ext/<host>/<path>) ──
+        if path.startswith("/ext/"):
+            self._handle_ext_asset(path, query)
+            return
+
         # ── Proxy jav.guru pages ──
         # Build the real URL
         real_url = BASE_URL + path
@@ -2576,20 +2926,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # Inject parse button on video pages
             content = inject_parse_button(content, real_url)
 
-            # Inject a floating "Downloads" badge on every page, linking to
-            # the download monitor.
-            badge = (
-                '<a id="javproxy-dl-badge" href="/downloads" style="'
-                'position:fixed;top:10px;left:10px;z-index:1000000;'
-                'background:#0f3460;color:#fff;border:1px solid #e94560;'
-                'border-radius:16px;padding:6px 14px;font:bold 12px Arial,sans-serif;'
-                'text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,.4);">'
-                'Downloads</a>'
-            )
-            if '</body>' in content:
-                content = content.replace('</body>', badge + '\n</body>', 1)
-            else:
-                content += badge
+            # Inject a floating nav (Downloads + supjav) on every page.
+            content = self._inject_nav_badge(content)
 
             # Build the proxy prefix from the incoming Host header so images
             # and links work correctly when accessed over LAN.
@@ -2708,6 +3046,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        # ── API: Save the supjav cf_clearance cookie (from the verify page) ──
+        if path == "/api/cf-cookie":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_json(400, {"error": "Invalid JSON"})
+                return
+            raw = data.get("cookie", "") or ""
+            m = re.search(r"cf_clearance=([^;]+)", raw)
+            if not m:
+                self.send_json(400, {"error": "cf_clearance cookie not found in the pasted text"})
+                return
+            cf_clearance = m.group(1).strip()
+            # Store the UA of the browser that earned the cookie (same browser
+            # that is posting it), since cf_clearance is bound to the UA.
+            ua = self.headers.get("User-Agent", "")
+            save_cf_cookie(cf_clearance, ua)
+            res = fetch_supjav("/", referer=SUPJAV_BASE)
+            self.send_json(200, {"ok": res["ok"], "challenge": res["challenge"], "status": res["status"]})
+            return
 
         if path == "/api/download":
             content_length = int(self.headers.get("Content-Length", 0))
