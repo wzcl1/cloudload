@@ -811,6 +811,10 @@ def solve_supjav_challenge(timeout=200):
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--js-flags=--max-old-space-size=512",
             ],
         )
         _supjav_log("cf-solve: chromium launched, opening supjav.com")
@@ -820,9 +824,14 @@ def solve_supjav_challenge(timeout=200):
             locale="en-US",
             timezone_id="UTC",
         )
-        # Mask the most obvious automation flag.
+        # Mask the automation fingerprints Cloudflare checks (headless
+        # Chromium fails several of these by default).
         ctx.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
+            "Object.defineProperty(navigator, 'plugins', {get: () => "
+            "[{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}]});"
+            "window.chrome = window.chrome || {runtime: {}};"
         )
         page = ctx.new_page()
         page.goto(SUPJAV_BASE + "/", wait_until="domcontentloaded", timeout=90000)
@@ -834,18 +843,28 @@ def solve_supjav_challenge(timeout=200):
         deadline = time.time() + timeout
         cleared = False
         checks = 0
+        box_clicked = False
+        frames_logged = False
         while time.time() < deadline:
             checks += 1
             try:
-                title = (page.title() or "").lower()
+                title = (page.title(timeout=10000) or "").lower()
             except Exception:
                 title = ""
             if checks % 10 == 1:
                 _supjav_log(f"cf-solve: waiting {time.time() - t0:.0f}s (title={title[:60]!r})")
+            if not frames_logged:
+                try:
+                    frames_logged = True
+                    _supjav_log("cf-solve: frames="
+                                + repr([(f.url or "")[:80] for f in page.frames]))
+                except Exception:
+                    pass
             if "just a moment" not in title:
                 try:
                     probe = page.evaluate(
-                        "() => document.body ? document.body.innerText.slice(0, 300) : ''")
+                        "() => document.body ? document.body.innerText.slice(0, 300) : ''",
+                        timeout=10000)
                 except Exception:
                     probe = ""
                 if probe.strip() and "just a moment" not in probe.lower():
@@ -853,13 +872,22 @@ def solve_supjav_challenge(timeout=200):
                     _supjav_log(f"cf-solve: challenge cleared after {time.time() - t0:.0f}s")
                     break
             # Best-effort: tick a Turnstile checkbox if one is present (the
-            # checkbox lives in a cross-origin Cloudflare iframe).
+            # challenge iframe is cross-origin and sometimes nested, so walk
+            # every frame). Logged once so docker logs show whether the
+            # interactive challenge appeared at all.
             try:
-                box = page.frame_locator(
-                    'iframe[src*="challenges.cloudflare.com"]').locator(
-                    'input[type="checkbox"]')
-                if box.count():
-                    box.first.click(timeout=1500)
+                for fr in page.frames:
+                    if "challenges.cloudflare.com" not in (fr.url or ""):
+                        continue
+                    try:
+                        cb = fr.locator('input[type="checkbox"]')
+                        if cb.count():
+                            cb.first.click(timeout=2000)
+                            if not box_clicked:
+                                _supjav_log("cf-solve: clicked Turnstile checkbox")
+                                box_clicked = True
+                    except Exception:
+                        pass
             except Exception:
                 pass
             page.wait_for_timeout(1200)
