@@ -3618,6 +3618,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     m = re.match(r"bytes=(\d+)-(\d*)", range_header)
                     if m:
                         start = int(m.group(1))
+                        if start >= file_size:
+                            # Unsatisfiable range (e.g. a probe for bytes past EOF).
+                            # Must be 416 — never a 206 with zero/negative length.
+                            self.send_response(416)
+                            self.send_header("Content-Range", f"bytes */{file_size}")
+                            self.send_header("Accept-Ranges", "bytes")
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
                         end = int(m.group(2)) if m.group(2) else file_size - 1
                         end = min(end, file_size - 1)
                         length = end - start + 1
