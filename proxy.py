@@ -793,13 +793,17 @@ def solve_supjav_challenge(timeout=200):
       playwright  True if Playwright was available to attempt a solve
       error       error string on failure ("" on success)
     """
+    _supjav_log(f"cf-solve: start (timeout={timeout}s)")
     if sync_playwright is None:
+        _supjav_log("cf-solve: FAILED — playwright not importable: "
+                    + (_PLAYWRIGHT_IMPORT_ERROR or "unknown"))
         return {"ok": False, "playwright": False,
                 "error": "playwright not importable: " + (_PLAYWRIGHT_IMPORT_ERROR or "unknown")}
     pw = None
     browser = None
     try:
         pw = sync_playwright().start()
+        _supjav_log("cf-solve: launching headless chromium...")
         browser = pw.chromium.launch(
             headless=True,
             timeout=90000,
@@ -809,6 +813,7 @@ def solve_supjav_challenge(timeout=200):
                 "--disable-dev-shm-usage",
             ],
         )
+        _supjav_log("cf-solve: chromium launched, opening supjav.com")
         ctx = browser.new_context(
             user_agent=_BROWSERS_UA,
             viewport={"width": 1366, "height": 768},
@@ -821,16 +826,22 @@ def solve_supjav_challenge(timeout=200):
         )
         page = ctx.new_page()
         page.goto(SUPJAV_BASE + "/", wait_until="domcontentloaded", timeout=90000)
+        _supjav_log("cf-solve: page loaded, waiting for challenge to clear")
 
         # Poll until the managed challenge clears (the interstitial title
         # "Just a moment..." is replaced by the real page).
+        t0 = time.time()
         deadline = time.time() + timeout
         cleared = False
+        checks = 0
         while time.time() < deadline:
+            checks += 1
             try:
                 title = (page.title() or "").lower()
             except Exception:
                 title = ""
+            if checks % 10 == 1:
+                _supjav_log(f"cf-solve: waiting {time.time() - t0:.0f}s (title={title[:60]!r})")
             if "just a moment" not in title:
                 try:
                     probe = page.evaluate(
@@ -839,6 +850,7 @@ def solve_supjav_challenge(timeout=200):
                     probe = ""
                 if probe.strip() and "just a moment" not in probe.lower():
                     cleared = True
+                    _supjav_log(f"cf-solve: challenge cleared after {time.time() - t0:.0f}s")
                     break
             # Best-effort: tick a Turnstile checkbox if one is present (the
             # checkbox lives in a cross-origin Cloudflare iframe).
@@ -853,24 +865,32 @@ def solve_supjav_challenge(timeout=200):
             page.wait_for_timeout(1200)
 
         if not cleared:
+            _supjav_log(f"cf-solve: FAILED — did not clear in {timeout}s (last title={title[:60]!r})")
             return {"ok": False, "playwright": True,
                     "error": "challenge did not clear in time (headless browser may be fingerprinted)"}
 
         cookies = ctx.cookies(SUPJAV_BASE)
         cf = next((c["value"] for c in cookies if c.get("name") == "cf_clearance"), "")
         if not cf:
+            _supjav_log("cf-solve: FAILED — no cf_clearance in cookies: "
+                        + repr([c.get("name") for c in cookies]))
             return {"ok": False, "playwright": True,
                     "error": "challenge cleared but no cf_clearance cookie was set"}
 
+        _supjav_log("cf-solve: cf_clearance saved, verifying with urllib...")
         save_cf_cookie(cf, _BROWSERS_UA)
         # Confirm the cookie actually works for our (non-browser) client before
         # declaring success — this is the path the proxy uses for pages.
         verify = fetch_supjav("/", referer=SUPJAV_BASE)
         if verify["ok"]:
+            _supjav_log("cf-solve: OK — cookie works, supjav unlocked")
             return {"ok": True, "playwright": True, "error": ""}
+        _supjav_log(f"cf-solve: FAILED — urllib still challenged "
+                    f"(status {verify['status']}, challenge={verify['challenge']})")
         return {"ok": False, "playwright": True,
                 "error": f"cf_clearance saved but urllib still challenged (status {verify['status']})"}
     except Exception as e:
+        _supjav_log(f"cf-solve: FAILED — exception: {type(e).__name__}: {e}")
         return {"ok": False, "playwright": True, "error": str(e)}
     finally:
         try:
@@ -887,7 +907,7 @@ def solve_supjav_challenge(timeout=200):
 
 # Background solve state so the (up to ~4 min) challenge solve runs off the
 # request thread and the browser page can poll for it instead of hanging.
-cf_solve_state = {"running": False, "error": "", "last_attempt": 0.0}
+cf_solve_state = {"running": False, "error": "", "last_attempt": 0.0, "started_at": 0.0}
 cf_solve_lock = threading.Lock()
 
 
@@ -896,13 +916,30 @@ def _cf_solve_worker():
         res = solve_supjav_challenge()
         with cf_solve_lock:
             cf_solve_state["error"] = res.get("error", "")
+        _supjav_log(f"cf-solve: worker finished ok={res.get('ok')}"
+                    + (f" error={res.get('error')}" if res.get("error") else ""))
     except Exception as e:
         with cf_solve_lock:
             cf_solve_state["error"] = str(e)
+        _supjav_log(f"cf-solve: worker crashed: {e}")
     finally:
         with cf_solve_lock:
             cf_solve_state["running"] = False
             cf_solve_state["last_attempt"] = time.time()
+
+
+def _cf_solve_snapshot():
+    """Return (solving, error); force-release a solve stuck for >6 min (a wedged
+    Playwright driver / OOM-killed browser would otherwise pin `running`
+    forever and the page would spin on 'Solving…' with no error)."""
+    with cf_solve_lock:
+        if cf_solve_state["running"] and time.time() - cf_solve_state["started_at"] > 360:
+            _supjav_log("cf-solve: no result after 6 min — releasing stuck solve")
+            cf_solve_state["running"] = False
+            cf_solve_state["error"] = ("solve hung for over 6 min (browser may be stuck "
+                                       "or OOM-killed — check free memory on the VPS)")
+            cf_solve_state["last_attempt"] = time.time()
+        return cf_solve_state["running"], cf_solve_state["error"]
 
 
 def trigger_cf_solve(cooldown=30):
@@ -914,6 +951,7 @@ def trigger_cf_solve(cooldown=30):
         if time.time() - cf_solve_state["last_attempt"] < cooldown:
             return False
         cf_solve_state["running"] = True  # reserve immediately to avoid races
+        cf_solve_state["started_at"] = time.time()
     threading.Thread(target=_cf_solve_worker, daemon=True).start()
     return True
 
@@ -3115,8 +3153,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     return
                 if sync_playwright is not None:
                     trigger_cf_solve()
-                with cf_solve_lock:
-                    solving = cf_solve_state["running"]
+                solving, _solve_err = _cf_solve_snapshot()
                 self.send_json(200, {
                     "ok": False, "solving": solving, "status": res["status"],
                     "message": ("Re-solving in the background…" if solving
@@ -3126,9 +3163,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # No stored cookie yet
             if sync_playwright is not None:
                 trigger_cf_solve()
-            with cf_solve_lock:
-                solving = cf_solve_state["running"]
-                solve_err = cf_solve_state["error"]
+            solving, solve_err = _cf_solve_snapshot()
             if solving:
                 self.send_json(200, {"ok": False, "solving": True, "status": 0})
                 return
