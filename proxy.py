@@ -1183,6 +1183,276 @@ if (AUTO) { poll(); } else { showManual('The built-in browser is not available o
 """
 
 
+# ── supjav wrapper page (iframe viewing + token handoff) ─────────────────────
+# Served for every /supjav/... request. The user's browser loads supjav.com
+# itself inside the iframe (Cloudflare is cleared in the user's browser, not on
+# the VPS). The download panel hands the video page's server tokens to the
+# proxy, which resolves and downloads the CF-free part.
+SUPJAV_WRAPPER_PAGE = '''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>supjav — JavProxy</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f0f1a; font-family: Arial, sans-serif; }
+  #bar { position: fixed; top: 0; left: 0; right: 0; height: 42px; z-index: 1000001;
+         display: flex; align-items: center; gap: 8px; padding: 0 10px;
+         background: #1a1a2e; border-bottom: 2px solid #e94560; box-sizing: border-box; }
+  #bar .logo { color: #e94560; font-weight: bold; font-size: 14px; white-space: nowrap; }
+  #bar .src { color: #888; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #bar a, #bar button { background: #0f3460; color: #fff; border: 1px solid #e94560; border-radius: 14px;
+         padding: 5px 12px; font: bold 12px Arial, sans-serif; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  #frame { position: fixed; top: 42px; left: 0; right: 0; bottom: 0; width: 100%;
+           height: calc(100% - 42px); border: 0; background: #fff; }
+  #panel { position: fixed; top: 46px; right: 8px; z-index: 1000002; width: 380px; max-width: calc(100vw - 16px);
+           max-height: calc(100% - 54px); overflow-y: auto; overscroll-behavior: contain;
+           background: #1a1a2e; border: 2px solid #e94560; border-radius: 12px; padding: 14px; color: #fff;
+           box-shadow: 0 8px 32px rgba(0,0,0,0.5); display: none; }
+  #panel h3 { margin: 0 0 8px; color: #e94560; font-size: 15px; }
+  #panel .step { font-size: 12px; color: #ccc; line-height: 1.5; margin: 8px 0; }
+  #snippet { background: #0d0d16; border: 1px solid #0f3460; border-radius: 8px; padding: 10px;
+             font: 11px/1.5 monospace; white-space: pre; overflow-x: auto;
+             user-select: all; -webkit-user-select: all; cursor: text; margin: 6px 0; }
+  #tok { width: 100%; box-sizing: border-box; background: #0d0d16; border: 1px solid #0f3460;
+         border-radius: 8px; padding: 8px; font: 11px monospace; color: #fff; }
+  #panel button { padding: 8px 12px; background: #0f3460; color: #fff; border: 1px solid #e94560;
+         border-radius: 6px; cursor: pointer; font-size: 12px; }
+  #bm { color: #9ecbff; font-weight: bold; text-decoration: none; }
+  .host-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px;
+              background: #16213e; border: 1px solid #0f3460; border-radius: 8px; margin-bottom: 8px; }
+  .host-row span { color: #fff; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .format-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0;
+                border-bottom: 1px solid #0f3460; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="logo">JavProxy</span>
+  <span class="src">supjav.com — loaded by your browser (Cloudflare clears here, not on the server)</span>
+  <a id="opentab" target="_blank" rel="noopener" href="__SRC__">Open in tab</a>
+  <a href="/downloads">Downloads</a>
+  <button id="dltoggle">&#11015; Download</button>
+</div>
+<iframe id="frame" src="__SRC__" allow="fullscreen"></iframe>
+<div id="panel">
+  <h3>Download this page</h3>
+  <div id="tok-status" style="font-size: 12px; color: #aaa;">No tokens yet — send them from the video page.</div>
+  <div id="hosts"></div>
+  <div id="fmts" style="margin-top: 8px;"></div>
+  <div class="step" id="howto">
+    <b>1.</b> On the video page (below, or in its own tab if the frame is blank): press F12,
+    go to the Console, paste this and press Enter:
+    <pre id="snippet"></pre>
+    <b>2.</b> It prints a proxy link (and copies it) — paste the link here, then Send:
+    <div style="display: flex; gap: 8px; margin-top: 6px;">
+      <input id="tok" placeholder="http://…/supjav/tokens?d=…">
+      <button id="toksubmit">Send</button>
+    </div>
+    <b>3.</b> One-time setup: drag this link to your bookmarks bar. Afterwards, one click on any
+    video page does everything for you: <a id="bm" href="#" draggable="true">&#11015; Send to proxy</a>
+  </div>
+</div>
+<script>
+(function() {
+  var ORIGIN = location.origin;
+  var panel = document.getElementById('panel');
+  var statusEl = document.getElementById('tok-status');
+  var hostsEl = document.getElementById('hosts');
+  var fmtsEl = document.getElementById('fmts');
+  var lastTs = 0;
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // Snippet to paste into the video page's DevTools console. Runs on
+  // supjav.com (user's browser), extracts the server tokens, prints a link
+  // that hands them to the proxy (and copies it).
+  var SNIPPET = [
+    "(async () => {",
+    "  const servers = [...document.querySelectorAll('a.btn-server[data-link]')]",
+    "    .map(a => ({ label: a.textContent.trim(), data_link: a.dataset.link }));",
+    "  const seen = new Set();",
+    "  const uniq = servers.filter(s => s.data_link && !seen.has(s.data_link) && seen.add(s.data_link));",
+    "  if (!uniq.length) { console.log('No server buttons found on this page.'); return; }",
+    "  const d = btoa(unescape(encodeURIComponent(JSON.stringify({ title: document.title, page_url: location.href, servers: uniq }))))",
+    "    .split('+').join('-').split('/').join('_').replace(/=+$/, '');",
+    "  const link = " + JSON.stringify(ORIGIN) + " + '/supjav/tokens?d=' + encodeURIComponent(d);",
+    "  try { copy(link); } catch (e) {}",
+    "  console.log('Sent ' + uniq.length + ' server(s) to the proxy.' + (typeof copy === 'function' ? ' Link copied - paste it into the JavProxy panel.' : ''));",
+    "  console.log(link);",
+    "})();"
+  ].join("\\n");
+  document.getElementById('snippet').textContent = SNIPPET;
+
+  // Bookmarklet version: same logic in one click, proxy origin baked in.
+  var BM = 'javascript:(function(){var s=[].slice.call(document.querySelectorAll("a.btn-server[data-link]")).map(function(a){return{label:a.textContent.trim(),data_link:a.dataset.link}});var seen={},u=[];s.forEach(function(x){if(x.data_link&&!seen[x.data_link]){seen[x.data_link]=1;u.push(x)}});if(!u.length){alert("No server buttons found on this page");return}var j=JSON.stringify({title:document.title,page_url:location.href,servers:u});var d=btoa(unescape(encodeURIComponent(j))).split("+").join("-").split("/").join("_").replace(/=+$/,"");window.open(' + JSON.stringify(ORIGIN) + ' + "/supjav/tokens?d=" + encodeURIComponent(d),"_blank")})();';
+  document.getElementById('bm').href = BM;
+
+  function showPanel(on) { panel.style.display = on ? 'block' : 'none'; }
+  var openNow = new URLSearchParams(location.search).has('open') || sessionStorage.getItem('jp_dl') === '1';
+  showPanel(openNow);
+  document.getElementById('dltoggle').onclick = function() {
+    var on = panel.style.display !== 'block';
+    showPanel(on);
+    sessionStorage.setItem('jp_dl', on ? '1' : '0');
+    if (on) { tick(); }
+  };
+
+  function hostRow(label) {
+    return '<div class="host-row">'
+      + '<span>' + esc(label) + '</span>'
+      + '<button onclick="parseHost(this)" data-label="' + esc(label) + '">Parse</button>'
+      + '</div>';
+  }
+
+  function formatRow(fmt, provider) {
+    return '<div class="format-row">'
+      + '<div style="min-width: 0; overflow: hidden; text-overflow: ellipsis;">'
+      + '<span style="color: #fff;">' + esc(fmt.resolution) + '</span> '
+      + '<span style="color: #888; font-size: 11px;">(' + esc(fmt.codec) + ')</span><br>'
+      + '<span style="color: #888; font-size: 11px;">Duration: ' + esc(fmt.duration) + '</span> | '
+      + '<span style="color: #888; font-size: 11px;">Size: ' + esc(fmt.size) + '</span>'
+      + '</div>'
+      + '<button onclick="downloadStream(this)" data-url="' + encodeURIComponent(fmt.url) + '" data-title="' + encodeURIComponent(fmt.title || '') + '" data-provider="' + encodeURIComponent(provider) + '" data-res="' + encodeURIComponent(fmt.resolution || '') + '" data-referer="' + encodeURIComponent(fmt._referer || '') + '" style="flex: 0 0 auto;">Download</button>'
+      + '</div>';
+  }
+
+  window.parseHost = function(btn) {
+    var label = btn.getAttribute('data-label');
+    btn.disabled = true; btn.textContent = 'Parsing...';
+    statusEl.textContent = 'Parsing ' + label + ' (token handoff)...';
+    fmtsEl.innerHTML = '';
+    fetch('/api/parse?url=' + encodeURIComponent(location.href) + '&provider=' + encodeURIComponent(label))
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.error) { throw new Error(data.error); }
+        var stream = data.streams[0];
+        if (stream.error) { throw new Error(stream.error + (stream.embed_url ? ' (' + stream.embed_url + ')' : '')); }
+        statusEl.textContent = 'Found ' + stream.formats.length + ' format(s) on ' + label + '.';
+        var h = '<div style="background: #16213e; border-radius: 8px; padding: 10px; border: 1px solid #0f3460;">';
+        h += '<div style="font-weight: bold; color: #e94560; margin-bottom: 6px;">' + esc(stream.provider) + '</div>';
+        stream.formats.forEach(function(f) { h += formatRow(f, stream.provider); });
+        h += '</div>';
+        fmtsEl.innerHTML = h;
+      })
+      .catch(function(e) { fmtsEl.innerHTML = '<div style="color: #ff6b6b; font-size: 12px;">' + esc(e.message) + '</div>'; })
+      .then(function() { btn.disabled = false; btn.textContent = 'Parse'; });
+  };
+
+  window.downloadStream = function(btn) {
+    var url = decodeURIComponent(btn.dataset.url);
+    var title = decodeURIComponent(btn.dataset.title || 'video');
+    btn.disabled = true; btn.textContent = 'Starting...';
+    fetch('/api/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: url,
+        title: title,
+        page_url: location.href,
+        provider: decodeURIComponent(btn.dataset.provider || ''),
+        resolution: decodeURIComponent(btn.dataset.res || ''),
+        referer: decodeURIComponent(btn.dataset.referer || '')
+      })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.error) { btn.textContent = 'Error: ' + data.error; btn.disabled = false; return; }
+        btn.textContent = 'Queued #' + data.id + ' - see Downloads';
+        pollDownload(data.id, btn);
+      })
+      .catch(function(e) { btn.textContent = 'Error: ' + e.message; btn.disabled = false; });
+  };
+
+  function pollDownload(id, btn) {
+    var interval = setInterval(function() {
+      fetch('/api/download/' + id)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.status === 'downloading') {
+            btn.textContent = data.progress || 'Downloading...';
+            if (!btn.nextElementSibling || !btn.nextElementSibling.classList.contains('cancel-btn')) {
+              var cancel = document.createElement('button');
+              cancel.className = 'cancel-btn';
+              cancel.textContent = 'Cancel';
+              cancel.style.cssText = 'margin-left: 6px; padding: 8px 12px; background: #6b2121; color: #fff; border: 1px solid #ff6b6b; border-radius: 6px; cursor: pointer; font-size: 12px;';
+              cancel.onclick = function() {
+                cancel.textContent = 'Cancelling...'; cancel.disabled = true;
+                fetch('/api/download/' + id, { method: 'DELETE' })
+                  .then(function() { cancel.textContent = 'Cancelled'; })
+                  .catch(function() { cancel.textContent = 'Error'; cancel.disabled = false; });
+              };
+              btn.parentNode.insertBefore(cancel, btn.nextSibling);
+            }
+          } else if (data.status === 'done') {
+            clearInterval(interval);
+            var cb = btn.nextElementSibling;
+            if (cb && cb.classList.contains('cancel-btn')) { cb.remove(); }
+            btn.textContent = 'Save As...'; btn.disabled = false;
+            btn.onclick = function() { window.location.href = '/api/file/' + id; };
+          } else if (data.status === 'error' || data.status === 'cancelled') {
+            clearInterval(interval);
+            var cb2 = btn.nextElementSibling;
+            if (cb2 && cb2.classList.contains('cancel-btn')) { cb2.remove(); }
+            btn.textContent = data.status === 'cancelled' ? 'Cancelled' : 'Error: ' + (data.error || 'unknown');
+            btn.disabled = false;
+          } else if (data.status === 'interrupted') {
+            clearInterval(interval);
+            var cb3 = btn.nextElementSibling;
+            if (cb3 && cb3.classList.contains('cancel-btn')) { cb3.remove(); }
+            btn.textContent = 'Interrupted - resume in Downloads'; btn.disabled = false;
+            btn.onclick = function() { window.location.href = '/downloads'; };
+          }
+        })
+        .catch(function() {});
+    }, 1000);
+  }
+
+  // Poll the token-handoff state; render server rows when tokens arrive.
+  function tick() {
+    fetch('/api/supjav/tokens')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.received) {
+          if (d.ts !== lastTs) {
+            lastTs = d.ts;
+            statusEl.style.color = '#4caf50';
+            statusEl.textContent = 'Tokens received: ' + d.servers.length + ' server(s)'
+              + (d.page_url ? ' for ' + d.page_url : '')
+              + ' (' + Math.round(d.age) + 's old)';
+            if (d.title) { document.title = d.title.slice(0, 60) + ' — JavProxy'; }
+            hostsEl.innerHTML = '<div style="font-size: 12px; color: #aaa; margin: 6px 0;">Servers — pick one:</div>'
+              + d.servers.map(function(s) { return hostRow(s.label); }).join('');
+          }
+        } else if (lastTs) {
+          lastTs = 0;
+          statusEl.style.color = '#aaa';
+          statusEl.textContent = 'No tokens yet — send them from the video page.';
+          hostsEl.innerHTML = '';
+          fmtsEl.innerHTML = '';
+        }
+      })
+      .catch(function() {});
+  }
+  setInterval(tick, 2000);
+  tick();
+
+  var tok = document.getElementById('tok');
+  function sendTok() {
+    var v = tok.value.trim();
+    if (v) { window.location = v; }
+  }
+  document.getElementById('toksubmit').onclick = sendTok;
+  tok.addEventListener('keydown', function(e) { if (e.key === 'Enter') { sendTok(); } });
+})();
+</script>
+</body>
+</html>
+'''
+
+
 def extract_base64_iframe_urls(page_html):
     """Extract base64-encoded iframe URLs from wp-btn-iframe data."""
     streams = []
@@ -1934,6 +2204,70 @@ def _get_redirect_location(url, referer=None, timeout=15):
         return 0, None
 
 
+# ── supjav token handoff ─────────────────────────────────────────────────────
+# The proxy no longer clears Cloudflare: the user's own browser loads
+# supjav.com (wrapper iframe or a plain tab), and a console snippet or
+# bookmarklet on the video page extracts the .btn-server[data-link] tokens and
+# hands them to the proxy via a short URL (/supjav/tokens?d=...). The
+# token -> 302 -> m3u8 chain is CF-free, so the server can resolve from there.
+supjav_tokens = {"servers": [], "title": "", "page_url": "", "ts": 0.0}
+supjav_tokens_lock = threading.Lock()
+SUPJAV_TOKEN_TTL = 1800  # data-link tokens are short-lived; 30-min safety cap
+
+
+def store_supjav_tokens(title, page_url, servers):
+    with supjav_tokens_lock:
+        supjav_tokens["servers"] = servers
+        supjav_tokens["title"] = title
+        supjav_tokens["page_url"] = page_url
+        supjav_tokens["ts"] = time.time()
+    _supjav_log("tokens received: %d server(s) %s from %s"
+                % (len(servers), [s["label"] for s in servers], page_url or "?"))
+
+
+def get_supjav_tokens():
+    """Fresh stored tokens, or None if missing/older than the TTL."""
+    with supjav_tokens_lock:
+        if not supjav_tokens["servers"]:
+            return None
+        age = time.time() - supjav_tokens["ts"]
+        if age > SUPJAV_TOKEN_TTL:
+            return None
+        return {"servers": list(supjav_tokens["servers"]),
+                "title": supjav_tokens["title"],
+                "page_url": supjav_tokens["page_url"],
+                "ts": supjav_tokens["ts"],
+                "age": age}
+
+
+def decode_supjav_token_payload(d):
+    """Decode the base64url JSON the snippet/bookmarklet sends in ?d=.
+
+    Returns {"title", "page_url", "servers"} or None if the payload is bad.
+    """
+    if not d:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(d + "=" * (-len(d) % 4))
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("servers"), list):
+        return None
+    servers = []
+    for s in data["servers"][:8]:
+        if not isinstance(s, dict):
+            continue
+        link = s.get("data_link")
+        if isinstance(link, str) and 8 <= len(link) <= 200:
+            servers.append({"data_link": link, "label": str(s.get("label", ""))[:30]})
+    if not servers:
+        return None
+    return {"title": str(data.get("title", ""))[:200],
+            "page_url": str(data.get("page_url", ""))[:500],
+            "servers": servers}
+
+
 def resolve_supjav_embed(data_link):
     """Resolve a supjav server's `data-link` token to the provider embed URL.
 
@@ -2029,7 +2363,30 @@ def extract_supjav_streams(page_path, provider=None):
     """Resolve and parse streams from a supjav video page.
 
     page_path is the path under SUPJAV_BASE (e.g. '/459349.html'). provider,
-    when given, is a server label (TV/FST/ST/VOE) to restrict to."""
+    when given, is a server label (TV/FST/ST/VOE) to restrict to.
+
+    Token-handoff mode (preferred): if the user's browser recently sent this
+    page's server tokens, use them directly — the proxy never has to fetch
+    supjav.com itself (and so never has to pass Cloudflare)."""
+    tok = get_supjav_tokens()
+    if tok:
+        title = re.sub(r"[^\w\s\-]", "", tok["title"])[:80].strip() or "video"
+        links = [s for s in tok["servers"] if s.get("data_link")]
+        _supjav_log(f"parse {page_path} via token handoff (age {tok['age']:.0f}s, "
+                    f"from {tok['page_url'] or '?'}): {len(links)} server(s) "
+                    f"{[l['label'] for l in links]}")
+        if provider is not None:
+            links = [l for l in links if l["label"].lower() == provider.lower()]
+            if not links:
+                return {"error": f"Server '{provider}' not found on this page",
+                        "title": title}
+        if not links:
+            return {"error": "No server tokens received — run the snippet on the video page",
+                    "title": title}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(links)) as pool:
+            results = list(pool.map(lambda s: _extract_one_supjav_server(s, title), links))
+        return {"title": title, "streams": results}
+
     res = fetch_supjav(page_path, referer=SUPJAV_BASE)
     if res.get("challenge"):
         return {"error": "Cloudflare challenge — cookie expired"}
@@ -3026,39 +3383,45 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_supjav(self, path, query):
-        """Serve a supjav.com page through the proxy. If the cf_clearance cookie
-        is missing or expired, kick off the (background) headless-browser solve
-        and show the connecting page, which polls /api/cf-check and redirects in
-        once the cookie is ready — falling back to manual steps if needed."""
+        """Serve supjav.com pages.
+
+        Viewing happens in the user's own browser (full-page iframe), which
+        clears Cloudflare itself — the VPS no longer runs headless Chromium for
+        it. The proxy only handles the CF-free part: resolving the data-link
+        tokens the browser hands over and downloading.
+
+        /supjav/tokens?d=<base64url json> is the handoff drop: the console
+        snippet or bookmarklet on the video page opens it; we store the tokens
+        and land on the wrapper page (download panel open) for that page."""
+        if path == SUPJAV_PREFIX + "/tokens":
+            params = urllib.parse.parse_qs(query)
+            payload = decode_supjav_token_payload(params.get("d", [""])[0])
+            if not payload:
+                body = (b"<html><head><title>Bad token</title></head>"
+                        b"<body style='background:#0f0f1a;color:#fff;font-family:Arial,sans-serif;padding:40px'>"
+                        b"<h2>Bad or empty token payload</h2>"
+                        b"<p>Run the snippet again on the video page and follow the link it prints.</p>"
+                        b"<p><a href='/supjav/' style='color:#e94560'>Back to supjav</a></p>"
+                        b"</body></html>")
+                self.send_response(400)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            store_supjav_tokens(payload["title"], payload["page_url"], payload["servers"])
+            loc = self._supjav_token_landing(payload["page_url"])
+            self.send_response(302)
+            self.send_header("Location", loc + ("&" if "?" in loc else "?") + "open=1")
+            self.end_headers()
+            return
+
         suffix = path[len(SUPJAV_PREFIX):] or "/"
         if query:
             suffix += "?" + query
-
-        # No cookie yet -> start a background solve (if we can) and show the page.
-        if not load_cf_cookie().get("cf_clearance"):
-            if sync_playwright is not None:
-                trigger_cf_solve()
-            self._serve_verify_page(suffix)
-            return
-
-        res = fetch_supjav(suffix, referer=SUPJAV_BASE)
-        if res["challenge"]:
-            # Stored cookie no longer passes -> try to re-solve in the background.
-            if sync_playwright is not None:
-                trigger_cf_solve()
-            self._serve_verify_page(suffix, note="Your Cloudflare cookie has expired — re-solving automatically.")
-            return
-        if not res["ok"] or not res["body"]:
-            self.send_error(502, f"Failed to fetch supjav.com (status {res['status']})")
-            return
-
-        content = rewrite_supjav_page(res["body"], SUPJAV_BASE + suffix)
-        # Inject the parse panel on video pages (server buttons -> streams).
-        content = inject_parse_button(content, SUPJAV_BASE + suffix)
-        # Inject the nav badge (Downloads + supjav) last, so its own links are
-        # untouched by the rewrites above.
-        content = self._inject_nav_badge(content)
-        body = content.encode("utf-8")
+        src = html.escape(SUPJAV_BASE + suffix, quote=True)
+        page = SUPJAV_WRAPPER_PAGE.replace("__SRC__", src)
+        body = page.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -3066,6 +3429,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    @staticmethod
+    def _supjav_token_landing(page_url):
+        """Wrapper URL for the page the tokens came from (fallback: supjav root)."""
+        try:
+            p = urllib.parse.urlparse(page_url)
+            if p.netloc.endswith("supjav.com") and p.path:
+                loc = SUPJAV_PREFIX + p.path
+                if p.query:
+                    loc += "?" + p.query
+                return loc
+        except Exception:
+            pass
+        return SUPJAV_PREFIX + "/"
 
     @staticmethod
     def _is_blocked_ext_host(host):
@@ -3169,6 +3546,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             url = BASE_URL + upstream_path
             result = extract_streams_from_page(url, provider)
             self.send_json(200, result)
+            return
+
+        # ── API: supjav token-handoff state (wrapper panel polls this) ──
+        if path == "/api/supjav/tokens":
+            tok = get_supjav_tokens()
+            if tok:
+                self.send_json(200, {
+                    "received": True,
+                    "title": tok["title"],
+                    "page_url": tok["page_url"],
+                    "ts": tok["ts"],
+                    "age": tok["age"],
+                    "servers": [{"label": s["label"]} for s in tok["servers"]],
+                })
+            else:
+                self.send_json(200, {"received": False})
             return
 
         # ── API: supjav CF cookie status (also drives the auto-solve) ──
