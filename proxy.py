@@ -775,7 +775,7 @@ def _is_cf_challenge(status, headers, text):
     return False
 
 
-def solve_supjav_challenge(timeout=40):
+def solve_supjav_challenge(timeout=200):
     """Solve supjav.com's Cloudflare challenge with a headless Chromium that runs
     on THIS host, then persist the resulting cf_clearance cookie.
 
@@ -802,6 +802,7 @@ def solve_supjav_challenge(timeout=40):
         pw = sync_playwright().start()
         browser = pw.chromium.launch(
             headless=True,
+            timeout=90000,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -819,7 +820,7 @@ def solve_supjav_challenge(timeout=40):
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = ctx.new_page()
-        page.goto(SUPJAV_BASE + "/", wait_until="domcontentloaded", timeout=30000)
+        page.goto(SUPJAV_BASE + "/", wait_until="domcontentloaded", timeout=90000)
 
         # Poll until the managed challenge clears (the interstitial title
         # "Just a moment..." is replaced by the real page).
@@ -884,7 +885,7 @@ def solve_supjav_challenge(timeout=40):
             pass
 
 
-# Background solve state so the (up to ~40s) challenge solve runs off the
+# Background solve state so the (up to ~4 min) challenge solve runs off the
 # request thread and the browser page can poll for it instead of hanging.
 cf_solve_state = {"running": False, "error": "", "last_attempt": 0.0}
 cf_solve_lock = threading.Lock()
@@ -1037,8 +1038,8 @@ code { background:#0f0f1a; border:1px solid #0f3460; border-radius:4px; padding:
   <p>supjav.com is protected by Cloudflare. The proxy clears that challenge with a
      built-in headless browser and caches the resulting cookie for a few days.</p>
   __NOTE__
-  <div id="status" class="busy">Solving the Cloudflare challenge&hellip; this usually takes a few seconds.</div>
-  <div id="auto-hint" class="hint">If this spins for more than a minute, use the manual steps below.</div>
+  <div id="status" class="busy">Solving the Cloudflare challenge&hellip; on a slow server this can take a few minutes.</div>
+  <div id="auto-hint" class="hint">If this spins for more than a few minutes, use the manual steps below.</div>
 
   <div id="manual" style="display:none; margin-top:18px; border-top:1px solid #0f3460; padding-top:16px;">
     <h2 style="color:#9ecbff; font-size:15px; margin:0 0 10px 0;">Manual fallback</h2>
@@ -1087,8 +1088,13 @@ let polls = 0;
 async function poll() {
   polls++;
   const done = await check();
-  if (!done && polls < 60) { setTimeout(poll, 3000); }
-  else if (!done) { document.getElementById('manual').style.display = 'block'; setStatus('Still solving… you can also try the manual steps above.', 'busy'); }
+  if (!done) {
+    if (polls >= 30) {
+      document.getElementById('manual').style.display = 'block';
+      setStatus('Still solving… on a slow server this can take a few minutes — you can also try the manual steps above.', 'busy');
+    }
+    setTimeout(poll, 3000);
+  }
 }
 async function saveCookie() {
   const raw = document.getElementById('cookie').value.trim();
