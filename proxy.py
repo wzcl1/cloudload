@@ -1789,6 +1789,60 @@ def _extract_vo_via_node(player_html, player_url):
         return None
 
 
+def _fetch_set_cookie(url, referer=None, timeout=15):
+    """Fetch a page and return its Set-Cookie header (or None).
+
+    Captures the cookie even when the page answers 4xx/5xx (StreamTape returns a
+    404 for a referer-less fetch but still sets the session cookie)."""
+    headers = {"User-Agent": _BROWSERS_UA, "Accept": "*/*",
+               "Accept-Language": "en-US,en;q=0.5"}
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.headers.get("Set-Cookie")
+    except urllib.error.HTTPError as e:
+        return e.headers.get("Set-Cookie")
+    except Exception:
+        return None
+
+
+def extract_streamtape(player_html, player_url):
+    """StreamTape: the player page embeds a clean `get_video?id=..&expires=..&ip=..&token=..`
+    link that 302-redirects (from the streamtape host) to a CDN MP4. It needs the
+    session cookie set when the page loads plus a same-page Referer, so we fetch
+    the page to grab the cookie, then HEAD the get_video link and follow the
+    redirect to the CDN URL (a progressive MP4, range-capable)."""
+    m = re.search(r"get_video\?id=[^&\"'<]+&expires=\d+&ip=[^&\"'<]+&token=[^&\"'<\s]+",
+                  player_html)
+    if not m:
+        return []
+    get_video_path = m.group(0)
+    parts = urllib.parse.urlsplit(player_url)
+    scheme = parts.scheme or "https"
+    host = parts.netloc
+    get_video_url = f"{scheme}://{host}/{get_video_path}"
+    cookie = _fetch_set_cookie(player_url, referer=player_url)
+    headers = {"User-Agent": _BROWSERS_UA, "Accept": "*/*",
+               "Accept-Language": "en-US,en;q=0.5", "Referer": player_url}
+    if cookie:
+        headers["Cookie"] = cookie
+    for attempt in range(2):
+        req = urllib.request.Request(get_video_url, method="HEAD", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                final_url = resp.geturl()
+                if "video" in ctype or final_url.lower().endswith(".mp4"):
+                    return [{"url": final_url, "kind": "mp4"}]
+        except Exception:
+            pass
+        if attempt == 0:
+            time.sleep(2)
+    return []
+
+
 def extract_stream_url(player_html, player_url):
     """Extract stream URLs, detecting the provider from page CONTENT.
 
@@ -1827,6 +1881,12 @@ def extract_stream_url(player_html, player_url):
         got = _extract_playerjs_file(js, player_url)       # EXTRA
         if got:
             return [got]
+
+    # 5. StreamTape: clean `get_video?...` link -> 302 -> CDN MP4.
+    if "get_video?" in player_html or "streamtape" in (player_url or ""):
+        got = extract_streamtape(player_html, player_url)
+        if got:
+            return got
 
     return []
 
