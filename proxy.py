@@ -1286,7 +1286,7 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
   document.getElementById('snippet').textContent = SNIPPET;
 
   // Bookmarklet version: same logic in one click, proxy origin baked in.
-  var BM = 'javascript:(function(){var s=[].slice.call(document.querySelectorAll("a.btn-server[data-link]")).map(function(a){return{label:a.textContent.trim(),data_link:a.dataset.link}});var seen={},u=[];s.forEach(function(x){if(x.data_link&&!seen[x.data_link]){seen[x.data_link]=1;u.push(x)}});if(!u.length){alert("No server buttons found on this page");return}var j=JSON.stringify({title:document.title,page_url:location.href,servers:u});var d=btoa(unescape(encodeURIComponent(j))).split("+").join("-").split("/").join("_").replace(/=+$/,"");window.open(' + JSON.stringify(ORIGIN) + ' + "/supjav/tokens?d=" + encodeURIComponent(d),"_blank")})();';
+  var BM = 'javascript:(function(){var s=[].slice.call(document.querySelectorAll("a.btn-server[data-link]")).map(function(a){return{label:a.textContent.trim(),data_link:a.dataset.link}});var seen={},u=[];s.forEach(function(x){if(x.data_link&&!seen[x.data_link]){seen[x.data_link]=1;u.push(x)}});if(!u.length){alert("No server buttons found on this page");return}var j=JSON.stringify({title:document.title,page_url:location.href,servers:u});var d=btoa(unescape(encodeURIComponent(j))).split("+").join("-").split("/").join("_").replace(/=+$/,"");var link=' + JSON.stringify(ORIGIN) + ' + "/supjav/tokens?d=" + encodeURIComponent(d);var w=window.open(link,"_blank");if(!w){location.href=link;}})();';
   document.getElementById('bm').href = BM;
 
   function hostRow(label) {
