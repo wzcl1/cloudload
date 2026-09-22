@@ -1808,28 +1808,47 @@ def _fetch_set_cookie(url, referer=None, timeout=15):
         return None
 
 
-def extract_streamtape(player_html, player_url):
-    """StreamTape: the player page embeds a clean `get_video?id=..&expires=..&ip=..&token=..`
-    link that 302-redirects (from the streamtape host) to a CDN MP4. It needs the
-    session cookie set when the page loads plus a same-page Referer, so we fetch
-    the page to grab the cookie, then HEAD the get_video link and follow the
-    redirect to the CDN URL (a progressive MP4, range-capable)."""
-    m = re.search(r"get_video\?id=[^&\"'<]+&expires=\d+&ip=[^&\"'<]+&token=[^&\"'<\s]+",
-                  player_html)
+def _parse_st_botlink(html):
+    """Reconstruct the StreamTape player's video source from the `#botlink`
+    obfuscated assignment. The page splits `//<host>/get_video?...token=...`
+    across string literals with `.substring()` chops; the player sets
+    `mainvideo.src = $('#botlink').text() + '&stream=1'`. Returns the full https
+    URL with `&stream=1` appended, or None if the pattern is not found."""
+    m = re.search(r"getElementById\('botlink'\)\.innerHTML = (.*);", html)
     if not m:
+        return None
+    expr = m.group(1)
+    lits = re.findall(r"['\"]([^'\"]*)['\"]", expr)
+    offs = [int(x) for x in re.findall(r"\.substring\((\d+)\)", expr)]
+    if not lits:
+        return None
+    last = lits[-1][sum(offs):] if offs else lits[-1]
+    url = "".join(lits[:-1]) + last
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not url.startswith("http"):
+        url = "https:" + url.lstrip("/")
+    if "&stream=1" in url:
+        return url
+    return url + "&stream=1"
+
+
+def extract_streamtape(player_html, player_url):
+    """StreamTape: the player sets `mainvideo.src = $('#botlink').text() +
+    '&stream=1'`; that `get_video?...` URL 302-redirects (from the streamtape
+    host/mirror) to a CDN progressive MP4. It needs the session cookie set when
+    the page loads plus a same-page Referer, so we fetch the page to grab the
+    cookie, then HEAD the botlink URL and follow the redirect to the CDN URL."""
+    src = _parse_st_botlink(player_html)
+    if not src:
         return []
-    get_video_path = m.group(0)
-    parts = urllib.parse.urlsplit(player_url)
-    scheme = parts.scheme or "https"
-    host = parts.netloc
-    get_video_url = f"{scheme}://{host}/{get_video_path}"
     cookie = _fetch_set_cookie(player_url, referer=player_url)
     headers = {"User-Agent": _BROWSERS_UA, "Accept": "*/*",
                "Accept-Language": "en-US,en;q=0.5", "Referer": player_url}
     if cookie:
         headers["Cookie"] = cookie
     for attempt in range(2):
-        req = urllib.request.Request(get_video_url, method="HEAD", headers=headers)
+        req = urllib.request.Request(src, method="HEAD", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
