@@ -1195,71 +1195,70 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>supjav — JavProxy</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #0f0f1a; font-family: Arial, sans-serif; }
-  #bar { position: fixed; top: 0; left: 0; right: 0; height: 42px; z-index: 1000001;
-         display: flex; align-items: center; gap: 8px; padding: 0 10px;
-         background: #1a1a2e; border-bottom: 2px solid #e94560; box-sizing: border-box; }
-  #bar .logo { color: #e94560; font-weight: bold; font-size: 14px; white-space: nowrap; }
-  #bar .src { color: #888; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #bar a, #bar button { background: #0f3460; color: #fff; border: 1px solid #e94560; border-radius: 14px;
-         padding: 5px 12px; font: bold 12px Arial, sans-serif; text-decoration: none; cursor: pointer; white-space: nowrap; }
-  #frame { position: fixed; top: 42px; left: 0; right: 0; bottom: 0; width: 100%;
-           height: calc(100% - 42px); border: 0; background: #fff; }
-  #panel { position: fixed; top: 46px; right: 8px; z-index: 1000002; width: 380px; max-width: calc(100vw - 16px);
-           max-height: calc(100% - 54px); overflow-y: auto; overscroll-behavior: contain;
-           background: #1a1a2e; border: 2px solid #e94560; border-radius: 12px; padding: 14px; color: #fff;
-           box-shadow: 0 8px 32px rgba(0,0,0,0.5); display: none; }
-  #panel h3 { margin: 0 0 8px; color: #e94560; font-size: 15px; }
-  #panel .step { font-size: 12px; color: #ccc; line-height: 1.5; margin: 8px 0; }
+  html, body { margin: 0; min-height: 100%; background: #0f0f1a; font-family: Arial, sans-serif; }
+  .wrap { max-width: 600px; margin: 0 auto; padding: 20px 14px 48px; }
+  .logo { color: #e94560; font-weight: bold; font-size: 18px; margin: 0 0 6px; }
+  .sub { color: #888; font-size: 12px; line-height: 1.5; margin: 0 0 14px; }
+  .card { background: #1a1a2e; border: 2px solid #e94560; border-radius: 12px; padding: 14px; color: #fff; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 10px; color: #e94560; font-size: 14px; }
+  .step { font-size: 12px; color: #ccc; line-height: 1.5; margin: 10px 0; }
+  .hint { color: #888; font-size: 11px; line-height: 1.5; margin: 6px 0; }
+  button, .btn { background: #0f3460; color: #fff; border: 1px solid #e94560; border-radius: 6px;
+          padding: 8px 12px; font: bold 12px Arial, sans-serif; text-decoration: none; cursor: pointer; display: inline-block; }
   #snippet { background: #0d0d16; border: 1px solid #0f3460; border-radius: 8px; padding: 10px;
-             font: 11px/1.5 monospace; white-space: pre; overflow-x: auto;
-             user-select: all; -webkit-user-select: all; cursor: text; margin: 6px 0; }
+              font: 11px/1.5 monospace; white-space: pre; overflow-x: auto;
+              user-select: all; -webkit-user-select: all; cursor: text; margin: 6px 0; }
   #tok { width: 100%; box-sizing: border-box; background: #0d0d16; border: 1px solid #0f3460;
-         border-radius: 8px; padding: 8px; font: 11px monospace; color: #fff; }
-  #panel button { padding: 8px 12px; background: #0f3460; color: #fff; border: 1px solid #e94560;
-         border-radius: 6px; cursor: pointer; font-size: 12px; }
+          border-radius: 8px; padding: 8px; font: 11px monospace; color: #fff; }
   #bm { color: #9ecbff; font-weight: bold; text-decoration: none; }
+  #tok-status { font-size: 12px; color: #aaa; margin: 0 0 8px; }
   .host-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px;
-              background: #16213e; border: 1px solid #0f3460; border-radius: 8px; margin-bottom: 8px; }
+               background: #16213e; border: 1px solid #0f3460; border-radius: 8px; margin-bottom: 8px; }
   .host-row span { color: #fff; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .format-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0;
-                border-bottom: 1px solid #0f3460; }
+                 border-bottom: 1px solid #0f3460; }
+  .dl-link { color: #9ecbff; font-size: 12px; }
 </style>
 </head>
 <body>
-<div id="bar">
-  <span class="logo">JavProxy</span>
-  <span class="src">supjav.com — loaded by your browser (Cloudflare clears here, not on the server)</span>
-  <a id="opentab" target="_blank" rel="noopener" href="__SRC__">Open in tab</a>
-  <a href="/downloads">Downloads</a>
-  <button id="dltoggle">&#11015; Download</button>
-</div>
-<iframe id="frame" src="__SRC__" allow="fullscreen"></iframe>
-<div id="panel">
-  <h3>Download this page</h3>
-  <div id="tok-status" style="font-size: 12px; color: #aaa;">No tokens yet — send them from the video page.</div>
-  <div id="hosts"></div>
-  <div id="fmts" style="margin-top: 8px;"></div>
-  <div class="step" id="howto">
-    <b>1.</b> On the video page (below, or in its own tab if the frame is blank): press F12,
-    go to the Console, paste this and press Enter:
+<div class="wrap">
+  <div class="logo">JavProxy &mdash; supjav</div>
+  <div class="sub">supjav.com refuses to be embedded, so the video page loads in its own tab &mdash; that&rsquo;s
+  where your browser clears Cloudflare (the server does no headless browsing). This panel receives the server
+  tokens the page hands over, then parses and downloads for you.</div>
+  <div class="card">
+    <h3>1 &mdash; Open the video page</h3>
+    <a class="btn" id="opentab" target="_blank" rel="noopener" href="__SRC__">Open video page in a new tab</a>
+    <div class="hint">Already open in a tab? Continue below.</div>
+  </div>
+  <div class="card">
+    <h3>2 &mdash; Send the server tokens (on the video page)</h3>
+    <div class="step">One-time setup: drag this to your bookmarks bar. Afterwards, one click on any supjav video
+    page sends the tokens and opens this panel ready to parse:
+    <a id="bm" href="#" draggable="true">&#11015; Send to proxy</a></div>
+    <div class="step">Or press F12 on the video page, open the Console, paste this and press Enter:</div>
     <pre id="snippet"></pre>
-    <b>2.</b> It prints a proxy link (and copies it) — paste the link here, then Send:
-    <div style="display: flex; gap: 8px; margin-top: 6px;">
-      <input id="tok" placeholder="http://…/supjav/tokens?d=…">
+    <div class="step">It prints a proxy link (and copies it) &mdash; paste it here and Send:</div>
+    <div style="display: flex; gap: 8px;">
+      <input id="tok" placeholder="http://&hellip;/supjav/tokens?d=&hellip;">
       <button id="toksubmit">Send</button>
     </div>
-    <b>3.</b> One-time setup: drag this link to your bookmarks bar. Afterwards, one click on any
-    video page does everything for you: <a id="bm" href="#" draggable="true">&#11015; Send to proxy</a>
   </div>
+  <div class="card">
+    <h3>3 &mdash; Parse &amp; download</h3>
+    <div id="tok-status">Waiting for tokens &mdash; send them from the video page (step 2).</div>
+    <div id="hosts"></div>
+    <div id="fmts" style="margin-top: 8px;"></div>
+  </div>
+  <a class="dl-link" href="/downloads">Downloads</a>
 </div>
 <script>
 (function() {
   var ORIGIN = location.origin;
-  var panel = document.getElementById('panel');
   var statusEl = document.getElementById('tok-status');
   var hostsEl = document.getElementById('hosts');
   var fmtsEl = document.getElementById('fmts');
+  var openTab = document.getElementById('opentab');
   var lastTs = 0;
 
   function esc(s) {
@@ -1283,22 +1282,12 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
     "  console.log('Sent ' + uniq.length + ' server(s) to the proxy.' + (typeof copy === 'function' ? ' Link copied - paste it into the JavProxy panel.' : ''));",
     "  console.log(link);",
     "})();"
-  ].join("\\n");
+  ].join("\n");
   document.getElementById('snippet').textContent = SNIPPET;
 
   // Bookmarklet version: same logic in one click, proxy origin baked in.
   var BM = 'javascript:(function(){var s=[].slice.call(document.querySelectorAll("a.btn-server[data-link]")).map(function(a){return{label:a.textContent.trim(),data_link:a.dataset.link}});var seen={},u=[];s.forEach(function(x){if(x.data_link&&!seen[x.data_link]){seen[x.data_link]=1;u.push(x)}});if(!u.length){alert("No server buttons found on this page");return}var j=JSON.stringify({title:document.title,page_url:location.href,servers:u});var d=btoa(unescape(encodeURIComponent(j))).split("+").join("-").split("/").join("_").replace(/=+$/,"");window.open(' + JSON.stringify(ORIGIN) + ' + "/supjav/tokens?d=" + encodeURIComponent(d),"_blank")})();';
   document.getElementById('bm').href = BM;
-
-  function showPanel(on) { panel.style.display = on ? 'block' : 'none'; }
-  var openNow = new URLSearchParams(location.search).has('open') || sessionStorage.getItem('jp_dl') === '1';
-  showPanel(openNow);
-  document.getElementById('dltoggle').onclick = function() {
-    var on = panel.style.display !== 'block';
-    showPanel(on);
-    sessionStorage.setItem('jp_dl', on ? '1' : '0');
-    if (on) { tick(); }
-  };
 
   function hostRow(label) {
     return '<div class="host-row">'
@@ -1423,13 +1412,14 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
               + (d.page_url ? ' for ' + d.page_url : '')
               + ' (' + Math.round(d.age) + 's old)';
             if (d.title) { document.title = d.title.slice(0, 60) + ' — JavProxy'; }
+            if (d.page_url) { openTab.href = d.page_url; }
             hostsEl.innerHTML = '<div style="font-size: 12px; color: #aaa; margin: 6px 0;">Servers — pick one:</div>'
               + d.servers.map(function(s) { return hostRow(s.label); }).join('');
           }
         } else if (lastTs) {
           lastTs = 0;
           statusEl.style.color = '#aaa';
-          statusEl.textContent = 'No tokens yet — send them from the video page.';
+          statusEl.textContent = 'Waiting for tokens — send them from the video page (step 2).';
           hostsEl.innerHTML = '';
           fmtsEl.innerHTML = '';
         }
@@ -3383,16 +3373,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_supjav(self, path, query):
-        """Serve supjav.com pages.
+        """Serve supjav.com control-panel pages.
 
-        Viewing happens in the user's own browser (full-page iframe), which
-        clears Cloudflare itself — the VPS no longer runs headless Chromium for
-        it. The proxy only handles the CF-free part: resolving the data-link
-        tokens the browser hands over and downloading.
+        supjav.com sends X-Frame-Options: SAMEORIGIN, so it cannot be iframed:
+        the user opens the video page in their own tab, where their browser
+        clears Cloudflare (the VPS no longer runs headless Chromium for it).
+        The page served here is a 3-step control panel: open the video tab,
+        hand the page's data-link tokens to /supjav/tokens, then parse and
+        download (the CF-free part the proxy does).
 
         /supjav/tokens?d=<base64url json> is the handoff drop: the console
         snippet or bookmarklet on the video page opens it; we store the tokens
-        and land on the wrapper page (download panel open) for that page."""
+        and land on the control panel for that page."""
         if path == SUPJAV_PREFIX + "/tokens":
             params = urllib.parse.parse_qs(query)
             payload = decode_supjav_token_payload(params.get("d", [""])[0])
@@ -3412,7 +3404,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             store_supjav_tokens(payload["title"], payload["page_url"], payload["servers"])
             loc = self._supjav_token_landing(payload["page_url"])
             self.send_response(302)
-            self.send_header("Location", loc + ("&" if "?" in loc else "?") + "open=1")
+            self.send_header("Location", loc)
             self.end_headers()
             return
 
