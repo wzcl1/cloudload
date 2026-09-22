@@ -1282,7 +1282,7 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
     "  console.log('Sent ' + uniq.length + ' server(s) to the proxy.' + (typeof copy === 'function' ? ' Link copied - paste it into the JavProxy panel.' : ''));",
     "  console.log(link);",
     "})();"
-  ].join("\n");
+  ].join("\\n");
   document.getElementById('snippet').textContent = SNIPPET;
 
   // Bookmarklet version: same logic in one click, proxy origin baked in.
