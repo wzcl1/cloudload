@@ -3286,8 +3286,8 @@ def render_player_page(dl_id):
     if info.get("status") != "done" or not info.get("file") or not os.path.exists(info["file"]):
         return None
 
-    title = html.escape(info.get("title", "Video"))
-    code = html.escape(info.get("code", ""))
+    title = html.escape(info.get("title") or "Video")
+    code = html.escape(info.get("code") or "")
     file_url = f"/api/file/{dl_id}"
 
     return PLAYER_VIDEO_PAGE.replace("__TITLE__", title).replace(
