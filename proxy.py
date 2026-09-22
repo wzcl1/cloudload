@@ -57,6 +57,20 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 SUPJAV_BASE = "https://supjav.com"
 SUPJAV_PREFIX = "/supjav"
 CF_COOKIE_FILE = os.path.join(DOWNLOAD_DIR, "supjav_cf.json")
+# Entry host(s) for supjav's token->provider redirector (supjav.php). Each
+# server button's `data-link` token is reversed and sent as `?c=`; that 302s to
+# the real provider embed (turbovidhls / fc2stream / streamtape / voe.sx).
+SUPJAV_PLAYER_HOSTS = ["lk1.supremejav.com"]
+
+
+def _supjav_log(msg):
+    """Trace the supjav resolution chain to stderr (visible in `docker logs`).
+
+    Useful while debugging provider embeds on the VPS: it records each server's
+    token->embed->m3u8 resolution, including embed URLs for providers we haven't
+    built a direct extractor for yet."""
+    sys.stderr.write(f"[supjav] {time.strftime('%H:%M:%S')} {msg}\n")
+    sys.stderr.flush()
 
 # Track active downloads: {id: {status, progress, file, title, error}}
 downloads = {}
@@ -329,8 +343,11 @@ def strip_ads_from_html(html_content, page_url=""):
 
 def inject_parse_button(html_content, page_url):
     """Inject a 'Parse Video Streams' button into video pages."""
-    # Only inject on pages that have stream buttons
-    if 'wp-btn-iframe' not in html_content and 'STREAM' not in html_content:
+    # Only inject on pages that have stream buttons (jav.guru: wp-btn-iframe /
+    # STREAM; supjav: btn-server / data-link server buttons).
+    has_supjav_player = ('btn-server' in html_content) or ('data-link=' in html_content)
+    if ('wp-btn-iframe' not in html_content and 'STREAM' not in html_content
+            and not has_supjav_player):
         return html_content
 
     # Extract the title from the page
@@ -1742,8 +1759,14 @@ def _extract_one_provider(stream, page_url, title):
             return {"provider": provider, "error": "Embed restricted for this domain"}
         return {"provider": provider, "error": "No stream URL found"}
 
-    # Expand each URL into downloadable formats: an m3u8 master playlist
-    # yields one format per resolution; everything else is a single format.
+    return _build_stream_result(provider, got_list, final_url, title)
+
+
+def _build_stream_result(provider, got_list, final_url, title):
+    """Expand a resolved provider's stream URLs into downloadable formats.
+
+    Shared by the jav.guru and supjav pipelines. An m3u8 master playlist yields
+    one format per resolution; anything else is a single format."""
     formats = []
     kind = got_list[0].get("kind", "m3u8")
     for got in got_list:
@@ -1812,6 +1835,152 @@ def _extract_one_provider(stream, page_url, title):
     }
 
 
+# ── supjav.com stream resolution ────────────────────────────────────────────
+
+
+def _get_redirect_location(url, referer=None, timeout=15):
+    """Return (status, location) for a redirecting URL without following it.
+
+    supjav's `supjav.php?c=` endpoint 302s to the provider embed; we want the
+    Location header, not the follow-on fetch. urllib raises HTTPError(302) when
+    a redirect handler returns None, which still carries the Location header."""
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+    headers = {"User-Agent": _BROWSERS_UA, "Accept": "*/*",
+               "Accept-Language": "en-US,en;q=0.5"}
+    if referer:
+        headers["Referer"] = referer
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        resp = opener.open(req, timeout=timeout)
+        return resp.getcode(), resp.headers.get("Location")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location")
+    except Exception:
+        return 0, None
+
+
+def resolve_supjav_embed(data_link):
+    """Resolve a supjav server's `data-link` token to the provider embed URL.
+
+    The token is reversed and sent to `supjav.php?c=<reversed>`; the endpoint
+    302-redirects to the real provider player. It needs a same-site Referer (the
+    `?l=` page) or returns an empty response. Returns (embed_url, entry) or
+    (None, None)."""
+    c = data_link[::-1]
+    for host in SUPJAV_PLAYER_HOSTS:
+        entry = f"https://{host}/supjav.php?c={c}"
+        referer = f"https://{host}/supjav.php?l={data_link}&bg=undefined"
+        status, loc = _get_redirect_location(entry, referer=referer)
+        if status in (301, 302, 303, 307, 308) and loc:
+            _supjav_log(f"resolve {data_link[:12]}... -> {loc.split('#')[0]}")
+            return loc.split("#")[0], entry
+        _supjav_log(f"resolve {data_link[:12]}... via {host}: status={status} loc={loc!r}")
+    return None, None
+
+
+def extract_supjav_data_links(page_html):
+    """Parse the `.btn-server[data-link]` server buttons from a supjav page."""
+    out, seen = [], set()
+    for tag in re.finditer(r"<a\b[^>]*>", page_html):
+        t = tag.group(0)
+        if "btn-server" not in t:
+            continue
+        dl = re.search(r'data-link="([^"]+)"', t)
+        if not dl:
+            continue
+        link = dl.group(1)
+        if link in seen:
+            continue
+        seen.add(link)
+        # Label is the text right after the opening '>' up to the closing tag.
+        rest = page_html[tag.end():tag.end() + 300]
+        label_m = re.match(r"^(.*?)</a>", rest, re.DOTALL)
+        label = re.sub(r"<[^>]+>", "", label_m.group(1)).strip() if label_m else ""
+        out.append({"data_link": link, "label": label})
+    return out
+
+
+def list_supjav_hosts(page_path):
+    """Return the parseable server buttons on a supjav video page."""
+    res = fetch_supjav(page_path, referer=SUPJAV_BASE)
+    if res.get("challenge"):
+        return {"error": "Cloudflare challenge — cookie expired", "hosts": []}
+    if not res.get("ok") or not res.get("body"):
+        return {"error": f"Failed to fetch supjav page (status {res.get('status')})",
+                "hosts": []}
+    links = extract_supjav_data_links(res["body"])
+    hosts = [{"label": l["label"], "var": l["data_link"]} for l in links if l["label"]]
+    return {"hosts": hosts}
+
+
+def _extract_one_supjav_server(server, title):
+    """Resolve and parse a single supjav server into downloadable formats."""
+    label = server["label"]
+    embed_url, entry = resolve_supjav_embed(server["data_link"])
+    if not embed_url:
+        _supjav_log(f"server {label}: no embed URL (token stale/expired?)")
+        return {"provider": label, "error": "Could not resolve server (no redirect)"}
+    player_html, final_url = fetch_url_full(embed_url, referer=entry)
+    if not player_html:
+        _supjav_log(f"server {label}: failed to fetch embed {embed_url}")
+        return {"provider": label, "error": "Failed to fetch provider page",
+                "embed_url": embed_url}
+    got_list = extract_stream_url(player_html, final_url)
+    if got_list:
+        _supjav_log(f"server {label}: stream {got_list[0].get('url','?')[:100]}")
+        return _build_stream_result(label, got_list, final_url, title)
+    # Not a provider the parser fully handles — hand off the embed URL so
+    # yt-dlp can try it in the download step.
+    _supjav_log(f"server {label}: no direct stream; fallback embed {embed_url}")
+    return {
+        "provider": label,
+        "formats": [{
+            "url": embed_url,
+            "type": "provider",
+            "resolution": "Unknown",
+            "codec": "Unknown",
+            "title": title,
+            "duration": "Unknown",
+            "size": "Unknown",
+            "_referer": entry,
+        }],
+        "stream_url": embed_url,
+        "kind": "provider",
+        "note": "Direct stream not extracted — will download via yt-dlp",
+    }
+
+
+def extract_supjav_streams(page_path, provider=None):
+    """Resolve and parse streams from a supjav video page.
+
+    page_path is the path under SUPJAV_BASE (e.g. '/459349.html'). provider,
+    when given, is a server label (TV/FST/ST/VOE) to restrict to."""
+    res = fetch_supjav(page_path, referer=SUPJAV_BASE)
+    if res.get("challenge"):
+        return {"error": "Cloudflare challenge — cookie expired"}
+    if not res.get("ok") or not res.get("body"):
+        return {"error": f"Failed to fetch supjav page (status {res.get('status')})"}
+    page_html = res["body"]
+    m = re.search(r"<title>([^<]+)</title>", page_html)
+    title = re.sub(r"[^\w\s\-]", "", (m.group(1).strip() if m else "video"))[:80].strip()
+    links = extract_supjav_data_links(page_html)
+    _supjav_log(f"parse {page_path} ({title[:40]!r}): {len(links)} server(s) "
+                f"{[l['label'] for l in links]}")
+    if provider is not None:
+        links = [l for l in links if l["label"].lower() == provider.lower()]
+        if not links:
+            return {"error": f"Server '{provider}' not found on this page",
+                    "title": title}
+    if not links:
+        return {"error": "No server buttons found on this page", "title": title}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(links)) as pool:
+        results = list(pool.map(lambda s: _extract_one_supjav_server(s, title), links))
+    return {"title": title, "streams": results}
+
+
 # ── Download management ─────────────────────────────────────────────────────
 
 def looks_like_video(path):
@@ -1847,11 +2016,17 @@ def find_stream_for_resume(page_url, provider, resolution):
     """Re-parse a video page and find the format matching provider+resolution."""
     if not page_url:
         return None
-    # page_url is usually the proxy URL (window.location.href); convert it
-    # back to the upstream jav.guru URL, same as /api/parse does.
+    # page_url is usually the proxy URL (window.location.href); convert it back
+    # to the upstream URL, same as /api/parse does (jav.guru or supjav).
     p = urllib.parse.urlparse(page_url)
-    upstream = BASE_URL + p.path + (("?" + p.query) if p.query else "")
-    result = extract_streams_from_page(upstream, provider)
+    if p.path == SUPJAV_PREFIX or p.path.startswith(SUPJAV_PREFIX + "/"):
+        supjav_path = p.path[len(SUPJAV_PREFIX):] or "/"
+        if p.query:
+            supjav_path += "?" + p.query
+        result = extract_supjav_streams(supjav_path, provider)
+    else:
+        upstream = BASE_URL + p.path + (("?" + p.query) if p.query else "")
+        result = extract_streams_from_page(upstream, provider)
     if result.get("error"):
         return None
     for s in result.get("streams", []):
@@ -2806,6 +2981,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         content = rewrite_supjav_page(res["body"], SUPJAV_BASE + suffix)
+        # Inject the parse panel on video pages (server buttons -> streams).
+        content = inject_parse_button(content, SUPJAV_BASE + suffix)
         # Inject the nav badge (Downloads + supjav) last, so its own links are
         # untouched by the rewrites above.
         content = self._inject_nav_badge(content)
@@ -2891,6 +3068,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             upstream_path = parsed_url.path
             if parsed_url.query:
                 upstream_path += "?" + parsed_url.query
+            if upstream_path == SUPJAV_PREFIX or upstream_path.startswith(SUPJAV_PREFIX + "/"):
+                supjav_path = upstream_path[len(SUPJAV_PREFIX):] or "/"
+                self.send_json(200, list_supjav_hosts(supjav_path))
+                return
             self.send_json(200, list_page_hosts(BASE_URL + upstream_path))
             return
 
@@ -2909,8 +3090,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             upstream_path = parsed_url.path
             if parsed_url.query:
                 upstream_path += "?" + parsed_url.query
+            if upstream_path == SUPJAV_PREFIX or upstream_path.startswith(SUPJAV_PREFIX + "/"):
+                supjav_path = upstream_path[len(SUPJAV_PREFIX):] or "/"
+                self.send_json(200, extract_supjav_streams(supjav_path, provider))
+                return
             url = BASE_URL + upstream_path
-
             result = extract_streams_from_page(url, provider)
             self.send_json(200, result)
             return
