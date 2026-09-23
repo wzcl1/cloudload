@@ -3,10 +3,9 @@
 Jav.guru + supjav.com proxy server with ad stripping and video stream extractor.
 
 - jav.guru: plain stdlib HTTP proxy.
-- supjav.com: sits behind a Cloudflare managed challenge. Cleared by a
-  headless Chromium (Playwright) running on this host, which earns a
-  cf_clearance cookie bound to this host's IP. A manual cookie-paste flow is
-  kept as a fallback.
+- supjav.com: sits behind a Cloudflare managed challenge. The user's own
+  browser clears it; the video page's server tokens are handed to the proxy
+  (/supjav/tokens), which resolves and downloads the CF-free part.
 - Downloads via yt-dlp / curl / aria2.
 """
 
@@ -30,15 +29,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from io import BytesIO
-
-# Playwright is optional at import time so the server still starts (and the
-# manual cookie-paste fallback still works) if the browser isn't installed.
-try:
-    from playwright.sync_api import sync_playwright
-    _PLAYWRIGHT_IMPORT_ERROR = ""
-except Exception as _e:  # pragma: no cover - import guard
-    sync_playwright = None
-    _PLAYWRIGHT_IMPORT_ERROR = str(_e)
 
 # ── Config ──────────────────────────────────────────────────────────────────
 LISTEN_PORT = 8080
@@ -737,15 +727,13 @@ def fetch_url_full(url, referer=None, timeout=20):
 # ── supjav.com (Cloudflare-gated) support ────────────────────────────────────
 #
 # supjav.com sits behind a Cloudflare *managed* challenge, which plain HTTP
-# clients (urllib/curl) cannot pass. The bypass is a `cf_clearance` cookie that
-# the user's own browser earns by solving the challenge interactively. The
-# cookie is bound to (public IP, User-Agent), so it only works when the proxy
-# server and the user's browser share a public IP (e.g. a home server behind
-# the same NAT). The cookie is stored on disk and attached to every upstream
-# supjav request.
-
-cf_lock = threading.Lock()
-
+# clients (urllib/curl) cannot pass. The normal path is token handoff: the
+# user's own browser clears the challenge on the video page and hands the
+# server tokens to /supjav/tokens. For the direct-fetch fallback
+# (fetch_supjav), an optionally stored cf_clearance cookie is attached if
+# CF_COOKIE_FILE exists; the cookie is bound to (public IP, User-Agent), so
+# it only works when the proxy and the browser that earned it share a
+# public IP.
 
 def load_cf_cookie():
     """Read the stored cf_clearance cookie. Returns {cf_clearance, user_agent} or {}."""
@@ -757,17 +745,6 @@ def load_cf_cookie():
     except (OSError, json.JSONDecodeError):
         pass
     return {}
-
-
-def save_cf_cookie(cf_clearance, user_agent=""):
-    """Persist the cf_clearance cookie + the UA that earned it."""
-    with cf_lock:
-        data = {"cf_clearance": cf_clearance, "user_agent": user_agent or ""}
-        tmp = CF_COOKIE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=1)
-        os.replace(tmp, CF_COOKIE_FILE)
-    return data
 
 
 def _cf_cookie_and_ua():
@@ -785,215 +762,6 @@ def _is_cf_challenge(status, headers, text):
     if status in (403, 503) and "Just a moment" in text and "challenges.cloudflare.com" in text:
         return True
     return False
-
-
-def solve_supjav_challenge(timeout=200):
-    """Solve supjav.com's Cloudflare challenge with a headless Chromium that runs
-    on THIS host, then persist the resulting cf_clearance cookie.
-
-    Because the browser runs on the proxy host, the cookie is bound to the
-    *proxy's* public IP + user-agent — so it stays valid for the proxy's own
-    urllib requests no matter where the end user browses from. This is the
-    VPS-friendly bypass (the manual cookie-paste flow only binds to the user's
-    IP and is kept as a fallback).
-
-    The browser is launched per solve and torn down afterwards, so it only
-    costs RAM while actively solving (first run / cookie expiry).
-
-    Returns a dict:
-      ok          True if a working cf_clearance cookie was stored
-      playwright  True if Playwright was available to attempt a solve
-      error       error string on failure ("" on success)
-    """
-    _supjav_log(f"cf-solve: start (timeout={timeout}s)")
-    if sync_playwright is None:
-        _supjav_log("cf-solve: FAILED — playwright not importable: "
-                    + (_PLAYWRIGHT_IMPORT_ERROR or "unknown"))
-        return {"ok": False, "playwright": False,
-                "error": "playwright not importable: " + (_PLAYWRIGHT_IMPORT_ERROR or "unknown")}
-    pw = None
-    browser = None
-    try:
-        pw = sync_playwright().start()
-        _supjav_log("cf-solve: launching headless chromium...")
-        browser = pw.chromium.launch(
-            headless=True,
-            timeout=90000,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--js-flags=--max-old-space-size=512",
-            ],
-        )
-        _supjav_log("cf-solve: chromium launched, opening supjav.com")
-        ctx = browser.new_context(
-            user_agent=_BROWSERS_UA,
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            timezone_id="UTC",
-        )
-        # Mask the automation fingerprints Cloudflare checks (headless
-        # Chromium fails several of these by default).
-        ctx.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
-            "Object.defineProperty(navigator, 'plugins', {get: () => "
-            "[{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}]});"
-            "window.chrome = window.chrome || {runtime: {}};"
-        )
-        page = ctx.new_page()
-        page.goto(SUPJAV_BASE + "/", wait_until="domcontentloaded", timeout=90000)
-        _supjav_log("cf-solve: page loaded, waiting for challenge to clear")
-
-        # Poll until the managed challenge clears (the interstitial title
-        # "Just a moment..." is replaced by the real page).
-        t0 = time.time()
-        deadline = time.time() + timeout
-        cleared = False
-        checks = 0
-        box_clicked = False
-        frames_logged = False
-        while time.time() < deadline:
-            checks += 1
-            try:
-                title = (page.title(timeout=10000) or "").lower()
-            except Exception:
-                title = ""
-            if checks % 10 == 1:
-                _supjav_log(f"cf-solve: waiting {time.time() - t0:.0f}s (title={title[:60]!r})")
-            if not frames_logged:
-                try:
-                    frames_logged = True
-                    _supjav_log("cf-solve: frames="
-                                + repr([(f.url or "")[:80] for f in page.frames]))
-                except Exception:
-                    pass
-            if "just a moment" not in title:
-                try:
-                    probe = page.evaluate(
-                        "() => document.body ? document.body.innerText.slice(0, 300) : ''",
-                        timeout=10000)
-                except Exception:
-                    probe = ""
-                if probe.strip() and "just a moment" not in probe.lower():
-                    cleared = True
-                    _supjav_log(f"cf-solve: challenge cleared after {time.time() - t0:.0f}s")
-                    break
-            # Best-effort: tick a Turnstile checkbox if one is present (the
-            # challenge iframe is cross-origin and sometimes nested, so walk
-            # every frame). Logged once so docker logs show whether the
-            # interactive challenge appeared at all.
-            try:
-                for fr in page.frames:
-                    if "challenges.cloudflare.com" not in (fr.url or ""):
-                        continue
-                    try:
-                        cb = fr.locator('input[type="checkbox"]')
-                        if cb.count():
-                            cb.first.click(timeout=2000)
-                            if not box_clicked:
-                                _supjav_log("cf-solve: clicked Turnstile checkbox")
-                                box_clicked = True
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            page.wait_for_timeout(1200)
-
-        if not cleared:
-            _supjav_log(f"cf-solve: FAILED — did not clear in {timeout}s (last title={title[:60]!r})")
-            return {"ok": False, "playwright": True,
-                    "error": "challenge did not clear in time (headless browser may be fingerprinted)"}
-
-        cookies = ctx.cookies(SUPJAV_BASE)
-        cf = next((c["value"] for c in cookies if c.get("name") == "cf_clearance"), "")
-        if not cf:
-            _supjav_log("cf-solve: FAILED — no cf_clearance in cookies: "
-                        + repr([c.get("name") for c in cookies]))
-            return {"ok": False, "playwright": True,
-                    "error": "challenge cleared but no cf_clearance cookie was set"}
-
-        _supjav_log("cf-solve: cf_clearance saved, verifying with urllib...")
-        save_cf_cookie(cf, _BROWSERS_UA)
-        # Confirm the cookie actually works for our (non-browser) client before
-        # declaring success — this is the path the proxy uses for pages.
-        verify = fetch_supjav("/", referer=SUPJAV_BASE)
-        if verify["ok"]:
-            _supjav_log("cf-solve: OK — cookie works, supjav unlocked")
-            return {"ok": True, "playwright": True, "error": ""}
-        _supjav_log(f"cf-solve: FAILED — urllib still challenged "
-                    f"(status {verify['status']}, challenge={verify['challenge']})")
-        return {"ok": False, "playwright": True,
-                "error": f"cf_clearance saved but urllib still challenged (status {verify['status']})"}
-    except Exception as e:
-        _supjav_log(f"cf-solve: FAILED — exception: {type(e).__name__}: {e}")
-        return {"ok": False, "playwright": True, "error": str(e)}
-    finally:
-        try:
-            if browser:
-                browser.close()
-        except Exception:
-            pass
-        try:
-            if pw:
-                pw.stop()
-        except Exception:
-            pass
-
-
-# Background solve state so the (up to ~4 min) challenge solve runs off the
-# request thread and the browser page can poll for it instead of hanging.
-cf_solve_state = {"running": False, "error": "", "last_attempt": 0.0, "started_at": 0.0}
-cf_solve_lock = threading.Lock()
-
-
-def _cf_solve_worker():
-    try:
-        res = solve_supjav_challenge()
-        with cf_solve_lock:
-            cf_solve_state["error"] = res.get("error", "")
-        _supjav_log(f"cf-solve: worker finished ok={res.get('ok')}"
-                    + (f" error={res.get('error')}" if res.get("error") else ""))
-    except Exception as e:
-        with cf_solve_lock:
-            cf_solve_state["error"] = str(e)
-        _supjav_log(f"cf-solve: worker crashed: {e}")
-    finally:
-        with cf_solve_lock:
-            cf_solve_state["running"] = False
-            cf_solve_state["last_attempt"] = time.time()
-
-
-def _cf_solve_snapshot():
-    """Return (solving, error); force-release a solve stuck for >6 min (a wedged
-    Playwright driver / OOM-killed browser would otherwise pin `running`
-    forever and the page would spin on 'Solving…' with no error)."""
-    with cf_solve_lock:
-        if cf_solve_state["running"] and time.time() - cf_solve_state["started_at"] > 360:
-            _supjav_log("cf-solve: no result after 6 min — releasing stuck solve")
-            cf_solve_state["running"] = False
-            cf_solve_state["error"] = ("solve hung for over 6 min (browser may be stuck "
-                                       "or OOM-killed — check free memory on the VPS)")
-            cf_solve_state["last_attempt"] = time.time()
-        return cf_solve_state["running"], cf_solve_state["error"]
-
-
-def trigger_cf_solve(cooldown=30):
-    """Start a background challenge solve if none is running and the last
-    attempt was at least `cooldown` seconds ago. Returns True if it started."""
-    with cf_solve_lock:
-        if cf_solve_state["running"]:
-            return False
-        if time.time() - cf_solve_state["last_attempt"] < cooldown:
-            return False
-        cf_solve_state["running"] = True  # reserve immediately to avoid races
-        cf_solve_state["started_at"] = time.time()
-    threading.Thread(target=_cf_solve_worker, daemon=True).start()
-    return True
 
 
 def fetch_supjav(path, referer=None, timeout=20):
@@ -1077,122 +845,6 @@ def rewrite_supjav_page(content, page_url=""):
         content
     )
     return content
-
-
-SUPJAV_VERIFY_PAGE = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Connecting to supjav.com - JavProxy</title>
-<style>
-body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:30px 16px; }
-.wrap { max-width:560px; margin:0 auto; background:#16213e; border:1px solid #0f3460;
-  border-radius:14px; padding:26px 24px; }
-h1 { color:#e94560; font-size:20px; margin:0 0 6px 0; }
-p { color:#bbb; font-size:14px; line-height:1.55; margin:12px 0; }
-.note { background:#3a2a12; border:1px solid #b8860b; color:#ffd27a; border-radius:8px;
-  padding:10px 12px; font-size:13px; }
-.step { display:flex; gap:12px; margin:14px 0; }
-.step .n { flex:0 0 auto; width:26px; height:26px; border-radius:50%; background:#0f3460;
-  color:#e94560; font-weight:bold; display:flex; align-items:center; justify-content:center;
-  font-size:14px; border:1px solid #e94560; }
-.step .t { color:#ccc; font-size:14px; line-height:1.5; padding-top:2px; }
-button, a.btn { display:inline-block; padding:12px 18px; border-radius:8px; border:1px solid #e94560;
-  background:#0f3460; color:#fff; font-size:14px; font-weight:bold; cursor:pointer; text-decoration:none; }
-button:hover, a.btn:hover { background:#16437e; }
-textarea { width:100%; box-sizing:border-box; background:#0f0f1a; color:#eee; border:1px solid #0f3460;
-  border-radius:8px; padding:10px; font-family:monospace; font-size:12px; min-height:74px; resize:vertical; }
-code { background:#0f0f1a; border:1px solid #0f3460; border-radius:4px; padding:1px 5px;
-  font-family:monospace; font-size:12px; color:#9ecbff; word-break:break-all; }
-#status { margin-top:14px; font-size:13px; min-height:18px; }
-#status.ok { color:#4caf50; } #status.err { color:#ff6b6b; } #status.busy { color:#ff9800; }
-.hint { color:#666; font-size:11px; margin-top:16px; line-height:1.5; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>Connecting to supjav.com</h1>
-  <p>supjav.com is protected by Cloudflare. The proxy clears that challenge with a
-     built-in headless browser and caches the resulting cookie for a few days.</p>
-  __NOTE__
-  <div id="status" class="busy">Solving the Cloudflare challenge&hellip; on a slow server this can take a few minutes.</div>
-  <div id="auto-hint" class="hint">If this spins for more than a few minutes, use the manual steps below.</div>
-
-  <div id="manual" style="display:none; margin-top:18px; border-top:1px solid #0f3460; padding-top:16px;">
-    <h2 style="color:#9ecbff; font-size:15px; margin:0 0 10px 0;">Manual fallback</h2>
-    <div class="step"><div class="n">1</div><div class="t">
-      Open supjav.com in a new tab and complete the Cloudflare check.
-    </div></div>
-    <div style="margin:6px 0 6px 38px;"><a class="btn" href="https://supjav.com/" target="_blank" rel="noopener">Open supjav.com</a></div>
-    <div class="step"><div class="n">2</div><div class="t">
-      In that tab, open DevTools (F12) &rarr; Console and run
-      <code>copy(document.cookie)</code>.
-    </div></div>
-    <div class="step"><div class="n">3</div><div class="t">
-      Paste the cookies below and click Save. The proxy keeps the
-      <code>cf_clearance</code> cookie.
-    </div></div>
-    <textarea id="cookie" placeholder="Paste the copied cookies here (cf_clearance=... is what's used)"></textarea>
-    <div style="margin-top:12px;"><button id="save" onclick="saveCookie()">Save &amp; verify</button></div>
-  </div>
-
-  <div class="hint">
-    The automatic solve runs on the server, so it works no matter where you browse
-    from. The manual fallback ties the cookie to your browser's IP + user-agent, so
-    it only works when your browser and the server share a public IP.
-  </div>
-</div>
-<script>
-const NEXT = __NEXT__;
-const AUTO = __AUTO__;
-function setStatus(msg, cls) { const s = document.getElementById('status'); s.textContent = msg; s.className = cls || ''; }
-function showManual(msg) {
-  document.getElementById('manual').style.display = 'block';
-  document.getElementById('auto-hint').style.display = 'none';
-  if (msg) setStatus(msg, 'err');
-}
-async function check() {
-  try {
-    const r = await fetch('/api/cf-check');
-    const d = await r.json();
-    if (d.ok) { setStatus('Cookie works — loading supjav.com...', 'ok'); setTimeout(() => location.href = NEXT, 400); return true; }
-    if (d.solving) { return false; }
-    showManual(d.message || 'Automatic solve is unavailable or failed — use the manual steps above.');
-    return true;
-  } catch (e) { return false; }
-}
-let polls = 0;
-async function poll() {
-  polls++;
-  const done = await check();
-  if (!done) {
-    if (polls >= 30) {
-      document.getElementById('manual').style.display = 'block';
-      setStatus('Still solving… on a slow server this can take a few minutes — you can also try the manual steps above.', 'busy');
-    }
-    setTimeout(poll, 3000);
-  }
-}
-async function saveCookie() {
-  const raw = document.getElementById('cookie').value.trim();
-  const btn = document.getElementById('save');
-  if (!raw) { setStatus('Paste the cookies first.', 'err'); return; }
-  btn.disabled = true; setStatus('Saving and testing against supjav.com...', 'busy');
-  try {
-    const r = await fetch('/api/cf-cookie', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cookie: raw }) });
-    const d = await r.json();
-    if (d.error) { setStatus('Error: ' + d.error, 'err'); btn.disabled = false; return; }
-    if (d.ok) { setStatus('Cookie works — loading supjav.com...', 'ok'); setTimeout(() => location.href = NEXT, 400); }
-    else { setStatus('Saved, but it did not pass the challenge (status ' + d.status + ').', 'err'); btn.disabled = false; }
-  } catch (e) { setStatus('Request failed: ' + e.message, 'err'); btn.disabled = false; }
-}
-if (AUTO) { poll(); } else { showManual('The built-in browser is not available on this server — use the manual steps below.'); }
-</script>
-</body>
-</html>
-"""
 
 
 # ── supjav wrapper page (iframe viewing + token handoff) ─────────────────────
@@ -1481,18 +1133,27 @@ def extract_base64_iframe_urls(page_html):
 
 def decode_intermediate_page(page_html):
     """From the intermediate /searcho/ page, extract the token and build the player URL."""
-    # Find the data attributes: data-XXXXX="value"
-    data_attrs = re.findall(r'data-(\w+)="([0-9a-f]+)"', page_html)
     # Find the rtype and base
     cfg_match = re.search(
         r'window\.cfg\s*=\s*\{[^}]*base\s*:\s*[\'"]([^\'"]+)[\'"][^}]*rtype\s*:\s*[\'"](\w)[\'"]',
         page_html, re.DOTALL
     )
-    if not cfg_match or len(data_attrs) < 3:
+    if not cfg_match:
         return None
 
     base = cfg_match.group(1)
     rtype = cfg_match.group(2)
+
+    # The token parts are data-XXX="hex" attributes near window.cfg. Scope the
+    # search to that region first so an unrelated data-foo="deadbeef" elsewhere
+    # in the markup can't be mistaken for a token part; fall back to the whole
+    # page if the region doesn't hold all three.
+    region = page_html[max(0, cfg_match.start() - 2000):cfg_match.end() + 4000]
+    data_attrs = re.findall(r'data-(\w+)="([0-9a-f]+)"', region)
+    if len(data_attrs) < 3:
+        data_attrs = re.findall(r'data-(\w+)="([0-9a-f]+)"', page_html)
+    if len(data_attrs) < 3:
+        return None
 
     # Concatenate the three data attribute values and reverse
     full_token = "".join(v for _, v in data_attrs[:3])
@@ -1562,7 +1223,9 @@ def decode_base36_eval(page_html):
         return None
 
     karr = dstr.split("|")
-    p = code.encode().decode("unicode_escape")
+    # raw_unicode_escape keeps non-ASCII chars intact; plain utf-8 bytes would
+    # be misread as latin-1 by unicode_escape and mojibake them.
+    p = code.encode("raw_unicode_escape").decode("unicode_escape")
     for idx in range(c - 1, -1, -1):
         if idx < len(karr) and karr[idx]:
             p = re.sub(
@@ -3481,21 +3144,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return False
 
     # ── supjav.com (Cloudflare-gated) handlers ──
-    def _serve_verify_page(self, next_path, note=""):
-        note_html = ""
-        if note:
-            note_html = f'<div class="note" style="margin-bottom:14px;">{html.escape(note)}</div>'
-        auto = "true" if sync_playwright is not None else "false"
-        page = SUPJAV_VERIFY_PAGE.replace("__NOTE__", note_html).replace(
-            "__NEXT__", json.dumps(next_path)).replace("__AUTO__", auto)
-        body = page.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
-
     def _handle_supjav(self, path, query):
         """Serve supjav.com control-panel pages.
 
@@ -3678,39 +3326,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 })
             else:
                 self.send_json(200, {"received": False})
-            return
-
-        # ── API: supjav CF cookie status (also drives the auto-solve) ──
-        if path == "/api/cf-check":
-            data = load_cf_cookie()
-            if data.get("cf_clearance"):
-                res = fetch_supjav("/", referer=SUPJAV_BASE)
-                if res["ok"]:
-                    self.send_json(200, {"ok": True, "solving": False, "status": res["status"]})
-                    return
-                if sync_playwright is not None:
-                    trigger_cf_solve()
-                solving, _solve_err = _cf_solve_snapshot()
-                self.send_json(200, {
-                    "ok": False, "solving": solving, "status": res["status"],
-                    "message": ("Re-solving in the background…" if solving
-                                else "Cookie did not pass the challenge"),
-                })
-                return
-            # No stored cookie yet
-            if sync_playwright is not None:
-                trigger_cf_solve()
-            solving, solve_err = _cf_solve_snapshot()
-            if solving:
-                self.send_json(200, {"ok": False, "solving": True, "status": 0})
-                return
-            if sync_playwright is None:
-                self.send_json(200, {"ok": False, "solving": False, "status": 0,
-                                     "playwright": False,
-                                     "message": "No cookie stored, and no built-in browser on this server."})
-                return
-            self.send_json(200, {"ok": False, "solving": False, "status": 0,
-                                 "message": solve_err or "No cookie stored."})
             return
 
         # ── API: Download status ──
@@ -4034,31 +3649,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # ── API: Save the supjav cf_clearance cookie (from the verify page) ──
-        if path == "/api/cf-cookie":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-            try:
-                data = json.loads(body)
-            except json.JSONDecodeError:
-                self.send_json(400, {"error": "Invalid JSON"})
-                return
-            raw = data.get("cookie", "") or ""
-            m = re.search(r"cf_clearance=([^;]+)", raw)
-            if not m:
-                self.send_json(400, {"error": "cf_clearance cookie not found in the pasted text"})
-                return
-            cf_clearance = m.group(1).strip()
-            # Store the UA of the browser that earned the cookie (same browser
-            # that is posting it), since cf_clearance is bound to the UA.
-            ua = self.headers.get("User-Agent", "")
-            save_cf_cookie(cf_clearance, ua)
-            res = fetch_supjav("/", referer=SUPJAV_BASE)
-            self.send_json(200, {"ok": res["ok"], "challenge": res["challenge"], "status": res["status"]})
-            return
-
         if path == "/api/download":
-            content_length = int(self.headers.get("Content-Length", 0))
+            try:
+                content_length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self.send_json(400, {"error": "Bad Content-Length header"})
+                return
             body = self.rfile.read(content_length)
             try:
                 data = json.loads(body)
@@ -4102,7 +3698,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # ── API: Resume an interrupted/failed download ──
         if path == "/api/download/resume":
-            content_length = int(self.headers.get("Content-Length", 0))
+            try:
+                content_length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self.send_json(400, {"error": "Bad Content-Length header"})
+                return
             body = self.rfile.read(content_length)
             try:
                 data = json.loads(body)
@@ -4117,9 +3717,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             if info.get("status") not in ("interrupted", "error", "cancelled"):
                 self.send_json(400, {"error": f"Cannot resume a download in status '{info.get('status')}'"})
-                return
-            if info.get("status") == "downloading":
-                self.send_json(400, {"error": "Already downloading"})
                 return
 
             # Re-resolve the stream: re-parse the video page and pick the same

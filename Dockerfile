@@ -18,11 +18,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # yt-dlp for downloading the resolved stream URLs.
-# Playwright + headless Chromium solve supjav.com's Cloudflare challenge from
-# this host's own IP (the cf_clearance cookie is bound to that IP), so the
-# bypass works regardless of where the end user browses from.
-RUN pip install --no-cache-dir --upgrade pip yt-dlp playwright \
-    && playwright install --with-deps chromium
+RUN pip install --no-cache-dir --upgrade pip yt-dlp
 
 WORKDIR /app
 COPY proxy.py vo_decode.js ./
