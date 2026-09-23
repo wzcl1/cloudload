@@ -3000,6 +3000,8 @@ def render_player_library():
         rows.append(
             f'<div class="card" onclick="location.href=\'/player?id={v["id"]}\'"'
             f' title="{html.escape(v["title"])}">'
+            f'  <button class="del" data-id="{v["id"]}" title="Delete"'
+            f' onclick="delVideo(event, this)">&times;</button>'
             f'  <div class="thumb">'
             f'    <svg viewBox="0 0 24 24" fill="#e94560" width="48" height="48">'
             f'      <path d="M8 5v14l11-7z"/>'
@@ -3036,8 +3038,17 @@ h1 a:hover { text-decoration:underline; }
 .card {
     background:#16213e; border:1px solid #0f3460; border-radius:10px;
     overflow:hidden; cursor:pointer; transition:border-color .15s, transform .15s;
+    position:relative;
 }
 .card:hover { border-color:#e94560; transform:translateY(-2px); }
+.card .del {
+    position:absolute; top:6px; right:6px; z-index:1;
+    width:24px; height:24px; padding:0; border-radius:50%;
+    border:1px solid #ff6b6b; background:rgba(15,15,26,.85); color:#ff6b6b;
+    font-size:16px; line-height:1; cursor:pointer; display:none;
+}
+.card:hover .del { display:block; }
+.card .del:hover { background:#6b2121; color:#fff; }
 .thumb {
     display:flex; align-items:center; justify-content:center;
     height:120px; background:#0f0f1a;
@@ -3055,6 +3066,17 @@ h1 a:hover { text-decoration:underline; }
 <h1>Player <a href="/downloads">Downloads</a></h1>
 <div style="color:#888;font-size:12px;margin-bottom:16px;">__COUNT__ video(s) ready</div>
 __GRID__
+<script>
+async function delVideo(ev, btn) {
+  ev.stopPropagation();
+  ev.preventDefault();
+  if (!confirm('Delete this video (and its file) from the server?')) return;
+  btn.disabled = true;
+  const r = await fetch('/api/file/' + btn.dataset.id, { method: 'DELETE' });
+  if (!r.ok) { alert('Delete failed'); btn.disabled = false; return; }
+  location.reload();
+}
+</script>
 </body>
 </html>
 """
