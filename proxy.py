@@ -343,11 +343,10 @@ def strip_ads_from_html(html_content, page_url=""):
 
 def inject_parse_button(html_content, page_url):
     """Inject a 'Parse Video Streams' button into video pages."""
-    # Only inject on pages that have stream buttons (jav.guru: wp-btn-iframe /
-    # STREAM; supjav: btn-server / data-link server buttons).
+    # Only inject on pages that have stream buttons (jav.guru: wp-btn-iframe;
+    # supjav: btn-server / data-link server buttons).
     has_supjav_player = ('btn-server' in html_content) or ('data-link=' in html_content)
-    if ('wp-btn-iframe' not in html_content and 'STREAM' not in html_content
-            and not has_supjav_player):
+    if 'wp-btn-iframe' not in html_content and not has_supjav_player:
         return html_content
 
     # Extract the title from the page
@@ -654,7 +653,18 @@ def rewrite_urls(html_content, proxy_prefix):
 
 # ── Stream extraction ───────────────────────────────────────────────────────
 
-def fetch_url(url, referer=None, timeout=10):
+def _origin_of(url):
+    """scheme://netloc of a URL, or None if it isn't an absolute http(s) URL."""
+    try:
+        p = urllib.parse.urlparse(url or "")
+        if p.scheme in ("http", "https") and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    except Exception:
+        pass
+    return None
+
+
+def fetch_url(url, referer=None, origin=None, timeout=10):
     """Fetch a URL and return the response body as string."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -663,6 +673,8 @@ def fetch_url(url, referer=None, timeout=10):
     }
     if referer:
         headers["Referer"] = referer
+    if origin:
+        headers["Origin"] = origin
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1916,7 +1928,8 @@ def parse_hls_master(master_url, referer=None):
     Each variant: {"url","resolution","bandwidth","codecs"}.
     Returns None if the URL is not a master playlist (i.e. a media playlist).
     """
-    content = fetch_url(master_url, referer=referer)
+    # maxstream-family CDNs gate playlist fetches on Referer+Origin.
+    content = fetch_url(master_url, referer=referer, origin=_origin_of(referer))
     if not content or "#EXT-X-STREAM-INF" not in content:
         return None
     lines = [l.strip() for l in content.splitlines()]
@@ -1944,13 +1957,17 @@ def parse_hls_master(master_url, referer=None):
                 })
                 i = j
         i += 1
-    variants.sort(key=lambda v: (v["bandwidth"], v["resolution"]), reverse=True)
+    def _res_key(r):
+        m = re.match(r"(\d+)x(\d+)", r or "")
+        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    variants.sort(key=lambda v: (v["bandwidth"],) + _res_key(v["resolution"]), reverse=True)
     return variants or None
 
 
-def playlist_duration(url):
+def playlist_duration(url, referer=None):
     """Fetch a media playlist and return (total_seconds, segment_count)."""
-    content = fetch_url(url)
+    # maxstream-family CDNs gate playlist fetches on Referer+Origin.
+    content = fetch_url(url, referer=referer, origin=_origin_of(referer))
     if not content:
         return 0, 0
     durations = [float(m) for m in re.findall(r'#EXTINF:([\d.]+)', content)]
@@ -2214,7 +2231,7 @@ def _build_stream_result(provider, got_list, final_url, title):
 
     # Fill in duration / size for every format.
     if kind == "m3u8":
-        total, _segs = playlist_duration(formats[0]["url"])
+        total, _segs = playlist_duration(formats[0]["url"], referer=formats[0].get("_referer"))
         hours, mins, secs = int(total // 3600), int((total % 3600) // 60), int(total % 60)
         duration = f"{hours}h {mins}m {secs}s" if total else "Unknown"
         for f in formats:
@@ -2438,6 +2455,15 @@ def extract_supjav_streams(page_path, provider=None):
     page's server tokens, use them directly — the proxy never has to fetch
     supjav.com itself (and so never has to pass Cloudflare)."""
     tok = get_supjav_tokens()
+    if tok:
+        tp = urllib.parse.urlparse(tok["page_url"] or "")
+        tok_path = tp.path
+        if tok_path == SUPJAV_PREFIX or tok_path.startswith(SUPJAV_PREFIX + "/"):
+            tok_path = tok_path[len(SUPJAV_PREFIX):] or "/"
+        if tok_path != page_path.split("?", 1)[0]:
+            _supjav_log(f"token handoff page {tok['page_url'] or '?'} does not "
+                        f"match requested {page_path}; refetching")
+            tok = None
     if tok:
         title = re.sub(r"[^\w\s\-]", "", tok["title"])[:80].strip() or "video"
         links = [s for s in tok["servers"] if s.get("data_link")]
@@ -2693,9 +2719,12 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
         referer = BASE_URL + p.path + (("?" + p.query) if p.query else "")
 
     if fresh:
+        protect = _other_active_prefixes(dl_id)
         for f in os.listdir(DOWNLOAD_DIR):
             fpath = os.path.join(DOWNLOAD_DIR, f)
-            if f.startswith(working) or (code and fpath == os.path.join(DOWNLOAD_DIR, code + ".mp4") and fpath not in other_files):
+            if any(f.startswith(p + ".") for p in protect):
+                continue
+            if f.startswith(working + ".") or (code and fpath == os.path.join(DOWNLOAD_DIR, code + ".mp4") and fpath not in other_files):
                 try:
                     os.remove(fpath)
                 except OSError:
@@ -2746,6 +2775,9 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
             rc, lines = 1, [f"yt-dlp failed to start: {e}"]
 
     if rc == 0:
+        with download_lock:
+            if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
+                return  # cancelled while the downloader was finishing
         _finish_download(dl_id, working, code)
         return
 
@@ -2767,7 +2799,7 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
                     new_referer = fmt["_referer"]
         if new_url != current_url:
             for f in os.listdir(DOWNLOAD_DIR):
-                if f.startswith(working):
+                if f.startswith(working + "."):
                     try:
                         os.remove(os.path.join(DOWNLOAD_DIR, f))
                     except OSError:
@@ -2790,6 +2822,8 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
         return run_download(dl_id, current_url, title, fresh=False, _attempt=_attempt + 1)
 
     with download_lock:
+        if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
+            return  # cancelled while the downloader was failing
         downloads[dl_id]["status"] = "error"
         downloads[dl_id]["error"] = (
             f"{downloader} failed (rc {rc})" + (f": {tail}" if tail else "")
@@ -2992,6 +3026,9 @@ def _run_ytdlp_once(dl_id, cmd):
 
 def _finish_download(dl_id, base, code):
     """Success path: locate the file, validate, remux, rename, mark done."""
+    with download_lock:
+        if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
+            return  # cancelled after the downloader exited
     # Find the downloaded file: only a plain "<base>.<ext>" match —
     # never yt-dlp helper files (.ytdl, -FragN) or our .remux.mp4.
     # If several match (retries with different containers), take the largest.
@@ -3007,6 +3044,8 @@ def _finish_download(dl_id, base, code):
             fpath = cand
     if fpath is None:
         with download_lock:
+            if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
+                return  # cancelled while finalizing
             downloads[dl_id]["status"] = "done"
             downloads[dl_id]["progress"] = "Complete (file not found on disk)"
             download_procs.pop(dl_id, None)
@@ -3020,6 +3059,8 @@ def _finish_download(dl_id, base, code):
         except OSError:
             pass
         with download_lock:
+            if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
+                return  # cancelled while finalizing
             downloads[dl_id]["status"] = "error"
             downloads[dl_id]["error"] = "Downloaded file is not a video (provider served an error image)"
             download_procs.pop(dl_id, None)
@@ -3036,6 +3077,8 @@ def _finish_download(dl_id, base, code):
         except OSError:
             pass
         with download_lock:
+            if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
+                return  # cancelled while finalizing
             downloads[dl_id]["status"] = "error"
             downloads[dl_id]["error"] = f"Downloaded file is not playable video ({msg})"
             download_procs.pop(dl_id, None)
@@ -3076,6 +3119,8 @@ def _finish_download(dl_id, base, code):
             except OSError:
                 pass
     with download_lock:
+        if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
+            return  # cancelled while finalizing
         downloads[dl_id]["status"] = "done"
         downloads[dl_id]["file"] = fpath
         downloads[dl_id]["code"] = code
@@ -3926,7 +3971,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     fpath = os.path.join(DOWNLOAD_DIR, f)
                     if fpath in other_files:
                         continue
-                    if f.startswith(base) and not any(f.startswith(p) for p in protect):
+                    if f.startswith(base + ".") and not any(f.startswith(p + ".") for p in protect):
                         try:
                             os.remove(fpath)
                         except OSError:
@@ -3965,7 +4010,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             protect = _other_active_prefixes(dl_id)
             if base:
                 for f in os.listdir(DOWNLOAD_DIR):
-                    if f.startswith(base) and not any(f.startswith(p) for p in protect):
+                    if f.startswith(base + ".") and not any(f.startswith(p + ".") for p in protect):
                         try:
                             os.remove(os.path.join(DOWNLOAD_DIR, f))
                         except OSError:
@@ -4028,10 +4073,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             global download_counter
-            download_counter += 1
-            dl_id = str(download_counter)
-
             with download_lock:
+                download_counter += 1
+                dl_id = str(download_counter)
                 downloads[dl_id] = {
                     "status": "queued",
                     "progress": "Waiting...",
@@ -4096,7 +4140,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 protect = _other_active_prefixes(dl_id)
                 if base:
                     for f in os.listdir(DOWNLOAD_DIR):
-                        if f.startswith(base) and not any(f.startswith(p) for p in protect):
+                        if f.startswith(base + ".") and not any(f.startswith(p + ".") for p in protect):
                             try:
                                 os.remove(os.path.join(DOWNLOAD_DIR, f))
                             except OSError:
