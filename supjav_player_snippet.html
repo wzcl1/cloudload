@@ -1,0 +1,40 @@
+<!-- supjav.com video page - key player section (post id 459349, FC2PPV-4979291) -->
+<!-- Theme: wp-content/themes/supjav2 (v2.54.13), JS: static/js/base.js + static/js/pcmload.js -->
+<!-- window._SJT = {uri:'https://supjav.com/wp-content/themes/supjav2', url:'https://supjav.com'} -->
+
+<!-- Player container (empty until a server is clicked; JS injects the player here) -->
+<div id="dz_video">
+  <div id="player-wrap" class="player-wrap" style="background-image: url(https://img.supjav.com/images/2026/09/FC2PPV-4979291.jpg);">
+    <div id="vserver" class="play-button"></div>
+    <div class="play-ad"></div>
+  </div>
+</div>
+
+<!-- Server buttons: data-link token is resolved by base.js into the player -->
+<div class="btns"><div class="btnst"><span class="btn-title">SERVER : </span>
+  <a href="javascript:;" class="btn-server active" data-link="0a424c145c959b8eaf8a240122a60f9af5422aca8ccc5e05d6838ba44eafb8efb8d1d11eae7114b6d8c060563b8be287dd6ede83fb6902ce4fdd70fe38e3bd3a69f9743a1b731d8dc96d10b9ba34595e">TV</a>
+  <a href="javascript:;" class="btn-server" data-link="ca4e03c348cb6e4c9f37cead49ee13e4d4d5dd0fbd793c3db142ef0a31ee055eaa5624863f5e6cf94576c069b2634dc940ec53eb3cf4f17270830acf091765df">FST</a>
+  <a href="javascript:;" class="btn-server" data-link="68a872f15aa82ca759a307b645aaa5d65f27f04b4c40d291f6178389af7d1a9b9f5c1d2161550254ebd50ad5f1bcdef5f47d5024e09976e94bc1add6b18d9eaa549b8fd2edab26b7049e1116b32c18c9">ST</a>
+  <a href="javascript:;" class="btn-server" data-link="a1e10d2d172f84814b5c098cbfba7465e2d88e19c64985650c57978e4891384c039a83b986791168d6131302aa479f545b8c9b26fdfbb54fef4cad7eaf8a6b32">VOE</a>
+</div></div>
+
+<!-- Download buttons: nameless base64 id param (decodes to 5670663405) + dl hash -->
+<div class="downs"><div class="downscase"><span class="btn-title">DOWNLOAD : </span>
+  <a href="https://supjav.com/?NTY3MDY2MzQwNQ%3D%3D&amp;dl=58da0a09827c2617aaa266d8051e841b2a38c45baca2e5af55423de78de30f82" class="btn-down" rel="nofollow" target="_blank">RG</a>
+  <a href="https://supjav.com/?NTY3MDY2MzQwNQ%3D%3D&amp;dl=8eced420ff996a43c5ef71e962a790030ebcd33769a40265f7f9591851674fcf" class="btn-down" rel="nofollow" target="_blank">K2S</a>
+</div></div>
+
+<!-- Views counter API (hints at the theme's endpoint pattern) -->
+<script>
+jQuery.post("/fyh-api.php?l=views&c=views",{post_id:'459349'},function(d,s){});
+</script>
+
+<!-- ===================== LIVE SESSION FINDINGS ===================== -->
+<!-- Video page URL pattern:  https://supjav.com/<post_id>.html  (here 459349.html) -->
+<!-- Player iframe:           https://lk1.supremejav.com/supjav.php?l=<data-link token>&bg=undefined -->
+<!--   * different domain (supremejav.com) than the page (supjav.com) -->
+<!--   * NOT hard-CF-gated: curl w/o cookie -> HTTP 200 body "404" (app-level, stale token) -->
+<!--   * tokens are per-page-view / short-lived; stale token => "404" body -->
+<!--   * page has a setInterval at line ~118-119 referencing a null element (see errors) -->
+<!-- Ad iframes to strip: go.mayzaent.com/smartpop, a.eix304.com/ad, go.mnaspm.com/smartpop -->
+<!-- NOTE: user browser is Firefox (console `copy()` not defined) -->

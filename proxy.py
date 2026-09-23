@@ -6,7 +6,7 @@ Jav.guru + supjav.com proxy server with ad stripping and video stream extractor.
 - supjav.com: sits behind a Cloudflare managed challenge. The user's own
   browser clears it; the video page's server tokens are handed to the proxy
   (/supjav/tokens), which resolves and downloads the CF-free part.
-- Downloads via yt-dlp / curl / aria2.
+- Downloads via yt-dlp / ffmpeg / aria2.
 """
 
 import base64
@@ -14,6 +14,7 @@ import concurrent.futures
 import hashlib
 import html
 import hmac
+import http.client
 import http.server
 import json
 import os
@@ -25,9 +26,7 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from io import BytesIO
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -40,6 +39,11 @@ MAX_DOWNLOADS = 3  # concurrent downloads
 # Optional basic auth: set both to enable, leave either unset to disable.
 BASIC_AUTH_USER = os.environ.get("BASIC_AUTH_USER", "")
 BASIC_AUTH_PASS = os.environ.get("BASIC_AUTH_PASS", "")
+
+_BROWSERS_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -300,19 +304,16 @@ def strip_ads_from_html(html_content, page_url=""):
         '', html_content, flags=re.DOTALL | re.IGNORECASE
     )
 
-    # Remove Cloudflare beacon
+    # Remove Cloudflare beacon/insights scripts (beacon.min.js + insights)
     html_content = re.sub(
-        r'<script[^>]*cloudflareinsights\.com[^>]*>.*?</script>',
+        r'<script[^>]*(?:cloudflareinsights\.com|beacon\.min\.js)[^>]*>.*?</script>',
         '', html_content, flags=re.DOTALL | re.IGNORECASE
     )
 
-    # Remove Yandex Metrika
+    # Remove Yandex Metrika (script beacon + noscript pixel)
     html_content = re.sub(
-        r'<script[^>]*mc\.yandex\.ru[^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-    html_content = re.sub(
-        r'<noscript>\s*<div[^>]*><img[^>]*mc\.yandex\.ru[^>]*>.*?</div>\s*</noscript>',
+        r'(?:<script[^>]*mc\.yandex\.ru[^>]*>.*?</script>'
+        r'|<noscript>\s*<div[^>]*><img[^>]*mc\.yandex\.ru[^>]*>.*?</div>\s*</noscript>)',
         '', html_content, flags=re.DOTALL | re.IGNORECASE
     )
 
@@ -322,61 +323,43 @@ def strip_ads_from_html(html_content, page_url=""):
         '', html_content, flags=re.DOTALL | re.IGNORECASE
     )
 
-    # Remove CloudFlare beacon script at end
-    html_content = re.sub(
-        r'<script[^>]*beacon\.min\.js[^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
     return html_content
 
 
-def inject_parse_button(html_content, page_url):
-    """Inject a 'Parse Video Streams' button into video pages."""
-    # Only inject on pages that have stream buttons (jav.guru: wp-btn-iframe;
-    # supjav: btn-server / data-link server buttons).
-    has_supjav_player = ('btn-server' in html_content) or ('data-link=' in html_content)
-    if 'wp-btn-iframe' not in html_content and not has_supjav_player:
-        return html_content
-
-    # Extract the title from the page
-    title_match = re.search(r'<title>([^<]+)</title>', html_content)
-    title = title_match.group(1) if title_match else "Video"
-
-    button_html = f'''
+PARSE_BUTTON_HTML = '''
   <style>
-  #javproxy-tools {{
+  #javproxy-tools {
       max-height: calc(100vh - 20px);
       overflow-y: auto;
       overscroll-behavior: contain;
       touch-action: pan-y;
       -webkit-overflow-scrolling: touch;
-  }}
-  #javproxy-tools button {{ touch-action: manipulation; }}
-  @media (max-width: 600px) {{
-      #javproxy-tools {{
+  }
+  #javproxy-tools button { touch-action: manipulation; }
+  @media (max-width: 600px) {
+      #javproxy-tools {
           left: 10px; right: 10px; width: auto; min-width: 0;
           padding: 10px !important; font-size: 12px !important;
-      }}
-      #javproxy-tools h3 {{ font-size: 13px !important; margin: 0 0 6px 0 !important; }}
-      #javproxy-tools #parse-btn {{
+      }
+      #javproxy-tools h3 { font-size: 13px !important; margin: 0 0 6px 0 !important; }
+      #javproxy-tools #parse-btn {
           padding: 8px !important; font-size: 12px !important; margin-bottom: 6px !important;
-      }}
-      #javproxy-tools .host-row {{
+      }
+      #javproxy-tools .host-row {
           padding: 6px 8px !important; gap: 6px !important;
-      }}
-      #javproxy-tools .host-row span {{ font-size: 12px !important; }}
-      #javproxy-tools .host-row button {{
+      }
+      #javproxy-tools .host-row span { font-size: 12px !important; }
+      #javproxy-tools .host-row button {
           padding: 6px 10px !important; font-size: 11px !important;
-      }}
-      #javproxy-tools .format-row {{
+      }
+      #javproxy-tools .format-row {
           padding: 4px 0 !important; gap: 6px !important;
-      }}
-      #javproxy-tools .format-row .fmt-info span {{ font-size: 11px !important; }}
-      #javproxy-tools .format-row button {{
+      }
+      #javproxy-tools .format-row .fmt-info span { font-size: 11px !important; }
+      #javproxy-tools .format-row button {
           padding: 6px 10px !important; font-size: 11px !important;
-      }}
-  }}
+      }
+  }
   </style>
   <div id="javproxy-tools" style="
      position: fixed; top: 10px; right: 10px; z-index: 999999;
@@ -399,39 +382,39 @@ def inject_parse_button(html_content, page_url):
 </div>
 
 <script>
-function esc(s) {{
+function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}}
+}
 
 // Keep touch scrolling inside the panel: when the panel hits its top/bottom
 // edge, cancel the gesture so the page underneath doesn't scroll. Needed on
 // mobile browsers that ignore overscroll-behavior.
-(function() {{
+(function() {
     const panel = document.getElementById('javproxy-tools');
     let lastY = null;
-    panel.addEventListener('touchstart', function(e) {{
+    panel.addEventListener('touchstart', function(e) {
         lastY = e.touches[0].clientY;
-    }}, {{ passive: true }});
-    panel.addEventListener('touchmove', function(e) {{
+    }, { passive: true });
+    panel.addEventListener('touchmove', function(e) {
         const y = e.touches[0].clientY;
         const dy = lastY - y;
         lastY = y;
         const atTop = panel.scrollTop <= 0;
         const atBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 1;
-        if ((atTop && dy > 0) || (atBottom && dy < 0)) {{
+        if ((atTop && dy > 0) || (atBottom && dy < 0)) {
             e.preventDefault();
-        }}
-    }}, {{ passive: false }});
-}})();
+        }
+    }, { passive: false });
+})();
 
-function hostRow(label) {{
+function hostRow(label) {
     return '<div class="host-row" style="display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px; background: #16213e; border: 1px solid #0f3460; border-radius: 8px; margin-bottom: 8px;">'
         + '<span style="color: #fff; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">' + esc(label) + '</span>'
         + '<button onclick="parseHost(this)" data-label="' + esc(label) + '" style="flex: 0 0 auto; padding: 10px 16px; background: #0f3460; color: #fff; border: 1px solid #e94560; border-radius: 6px; cursor: pointer; font-size: 13px;">Parse</button>'
         + '</div>';
-}}
+}
 
-function formatRow(fmt, provider) {{
+function formatRow(fmt, provider) {
     return '<div class="format-row" style="display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #0f3460;">'
         + '<div class="fmt-info" style="min-width: 0; overflow: hidden; text-overflow: ellipsis;">'
         + '<span style="color: #fff;">' + esc(fmt.resolution) + '</span> '
@@ -444,9 +427,9 @@ function formatRow(fmt, provider) {{
         + 'border-radius: 6px; cursor: pointer; font-size: 13px; white-space: nowrap;'
         + '">Download</button>'
         + '</div>';
-}}
+}
 
-async function parseStreams() {{
+async function parseStreams() {
     const btn = document.getElementById('parse-btn');
     const status = document.getElementById('parse-status');
     const results = document.getElementById('stream-results');
@@ -459,28 +442,28 @@ async function parseStreams() {{
     results.innerHTML = '';
     fmts.innerHTML = '';
 
-    try {{
+    try {
         const resp = await fetch('/api/hosts?url=' + encodeURIComponent(window.location.href));
         const data = await resp.json();
 
-        if (data.error) {{
+        if (data.error) {
             throw new Error(data.error);
-        }}
-        if (!data.hosts.length) {{
+        }
+        if (!data.hosts.length) {
             throw new Error('No parseable hosts found on this page');
-        }}
+        }
 
         results.innerHTML = data.hosts.map(h => hostRow(h.label)).join('');
         status.textContent = data.hosts.length + ' host(s) available — pick one to parse.';
-    }} catch (e) {{
+    } catch (e) {
         status.innerHTML = '<span style="color: #ff6b6b;">Error: ' + esc(e.message) + '</span>';
-    }}
+    }
 
     btn.disabled = false;
     btn.textContent = 'Show Stream Hosts';
-}}
+}
 
-async function parseHost(btn) {{
+async function parseHost(btn) {
     const label = btn.dataset.label;
     const status = document.getElementById('parse-status');
     const fmts = document.getElementById('format-results');
@@ -491,129 +474,139 @@ async function parseHost(btn) {{
     status.textContent = 'Parsing ' + label + '...';
     fmts.innerHTML = '';
 
-    try {{
+    try {
         const resp = await fetch('/api/parse?url=' + encodeURIComponent(window.location.href) + '&provider=' + encodeURIComponent(label));
         const data = await resp.json();
 
-        if (data.error) {{
+        if (data.error) {
             throw new Error(data.error);
-        }}
+        }
         const stream = data.streams[0];
-        if (stream.error) {{
+        if (stream.error) {
             throw new Error(stream.error);
-        }}
+        }
 
         status.textContent = 'Found ' + stream.formats.length + ' format(s) on ' + label + '.';
         let html = '<div style="background: #16213e; border-radius: 8px; padding: 12px; border: 1px solid #0f3460;">';
         html += '<div style="font-weight: bold; color: #e94560; margin-bottom: 6px;">' + esc(stream.provider) + '</div>';
-        for (const fmt of stream.formats) {{
+        for (const fmt of stream.formats) {
             html += formatRow(fmt, stream.provider);
-        }}
+        }
         html += '</div>';
         fmts.innerHTML = html;
-    }} catch (e) {{
+    } catch (e) {
         fmts.innerHTML = '<div style="color: #ff6b6b; font-size: 12px;">' + esc(e.message) + '</div>';
-    }}
+    }
 
     btn.disabled = false;
     btn.textContent = 'Parse';
-}}
+}
 
-async function downloadStream(btn) {{
+async function downloadStream(btn) {
     const url = decodeURIComponent(btn.dataset.url);
     const title = decodeURIComponent(btn.dataset.title || 'video');
     btn.disabled = true;
     btn.textContent = 'Starting...';
 
-    try {{
-        const resp = await fetch('/api/download', {{
+    try {
+        const resp = await fetch('/api/download', {
             method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
                 url: url,
                 title: title,
                 page_url: window.location.href,
                 provider: decodeURIComponent(btn.dataset.provider || ''),
                 resolution: decodeURIComponent(btn.dataset.res || ''),
                 referer: decodeURIComponent(btn.dataset.referer || '')
-            }})
-        }});
+            })
+        });
         const data = await resp.json();
-        if (data.error) {{
+        if (data.error) {
             btn.textContent = 'Error: ' + data.error;
             btn.disabled = false;
             return;
-        }}
+        }
         btn.textContent = 'Queued #' + data.id + ' — see Downloads';
         pollDownload(data.id, btn);
-    }} catch (e) {{
+    } catch (e) {
         btn.textContent = 'Error: ' + e.message;
         btn.disabled = false;
-    }}
-}}
+    }
+}
 
-function pollDownload(id, btn) {{
-    const interval = setInterval(async () => {{
-        try {{
+function pollDownload(id, btn) {
+    const interval = setInterval(async () => {
+        try {
             const resp = await fetch('/api/download/' + id);
             const data = await resp.json();
 
-            if (data.status === 'downloading') {{
+            if (data.status === 'downloading') {
                 btn.textContent = data.progress || 'Downloading...';
                 // Show a cancel button next to the download button
-                if (!btn.nextElementSibling || !btn.nextElementSibling.classList.contains('cancel-btn')) {{
+                if (!btn.nextElementSibling || !btn.nextElementSibling.classList.contains('cancel-btn')) {
                     const cancel = document.createElement('button');
                     cancel.className = 'cancel-btn';
                     cancel.textContent = 'Cancel';
                     cancel.style.cssText = 'margin-left: 6px; padding: 10px 14px; background: #6b2121; color: #fff; border: 1px solid #ff6b6b; border-radius: 6px; cursor: pointer; font-size: 12px; touch-action: manipulation;';
-                    cancel.onclick = function() {{ cancelDownload(id, btn, cancel); }};
+                    cancel.onclick = function() { cancelDownload(id, btn, cancel); };
                     btn.parentNode.insertBefore(cancel, btn.nextSibling);
-                }}
-            }} else if (data.status === 'done') {{
+                }
+            } else if (data.status === 'done') {
                 clearInterval(interval);
                 // Remove cancel button if present
                 const cancelBtn = btn.nextElementSibling;
                 if (cancelBtn && cancelBtn.classList.contains('cancel-btn')) cancelBtn.remove();
                 btn.textContent = 'Save As...';
                 btn.disabled = false;
-                btn.onclick = function() {{
+                btn.onclick = function() {
                     window.location.href = '/api/file/' + id;
-                }};
-            }} else if (data.status === 'error' || data.status === 'cancelled') {{
+                };
+            } else if (data.status === 'error' || data.status === 'cancelled') {
                 clearInterval(interval);
                 const cancelBtn = btn.nextElementSibling;
                 if (cancelBtn && cancelBtn.classList.contains('cancel-btn')) cancelBtn.remove();
                 btn.textContent = data.status === 'cancelled' ? 'Cancelled' : 'Error: ' + (data.error || 'unknown');
                 btn.disabled = false;
-            }} else if (data.status === 'interrupted') {{
+            } else if (data.status === 'interrupted') {
                 clearInterval(interval);
                 const cancelBtn = btn.nextElementSibling;
                 if (cancelBtn && cancelBtn.classList.contains('cancel-btn')) cancelBtn.remove();
                 btn.textContent = 'Interrupted — resume in Downloads';
                 btn.disabled = false;
-                btn.onclick = function() {{ window.location.href = '/downloads'; }};
-            }}
-        }} catch (e) {{
+                btn.onclick = function() { window.location.href = '/downloads'; };
+            }
+        } catch (e) {
             // keep polling
-        }}
-    }}, 1000);
-}}
+        }
+    }, 1000);
+}
 
-async function cancelDownload(id, btn, cancelBtn) {{
+async function cancelDownload(id, btn, cancelBtn) {
     cancelBtn.textContent = 'Cancelling...';
     cancelBtn.disabled = true;
-    try {{
-        await fetch('/api/download/' + id, {{ method: 'DELETE' }});
+    try {
+        await fetch('/api/download/' + id, { method: 'DELETE' });
         cancelBtn.textContent = 'Cancelled';
-    }} catch (e) {{
+    } catch (e) {
         cancelBtn.textContent = 'Error';
         cancelBtn.disabled = false;
-    }}
-}}
+    }
+}
 </script>
 '''
+
+
+def inject_parse_button(html_content):
+    """Inject a 'Parse Video Streams' button into video pages."""
+    # Only inject on pages that have stream buttons (jav.guru: wp-btn-iframe;
+    # supjav: btn-server / data-link server buttons).
+    has_supjav_player = ('btn-server' in html_content) or ('data-link=' in html_content)
+    if 'wp-btn-iframe' not in html_content and not has_supjav_player:
+        return html_content
+
     # Insert before </body>
-    html_content = html_content.replace('</body>', button_html + '\n</body>')
+    html_content = html_content.replace('</body>', PARSE_BUTTON_HTML + '\n</body>')
     return html_content
 
 
@@ -654,10 +647,135 @@ def _origin_of(url):
     return None
 
 
+# ── Pooled upstream fetching ────────────────────────────────────────────────
+# A provider parse walks 4-6 URLs on the same origin (page -> intermediate ->
+# player -> master -> media playlist). Opening a fresh TLS connection per hop
+# pays the handshake every time; this tiny per-origin pool reuses the socket
+# for the whole chain (and for the next parse that arrives while it sits
+# idle), so a parse costs about one handshake per origin.
+
+POOL_IDLE_TTL = 30.0   # drop pooled sockets that sat idle this long
+POOL_MAX_IDLE = 4      # keep-alive sockets kept per origin
+_conn_pool = {}        # (scheme, host, port) -> [(conn, idle_since), ...]
+_conn_pool_lock = threading.Lock()
+
+
+def _pool_get(key):
+    """Pop the newest usable connection for `key`, or None if there is none."""
+    with _conn_pool_lock:
+        conns = _conn_pool.get(key)
+        if not conns:
+            return None
+        now = time.time()
+        conn = None
+        while conns:
+            cand, ts = conns.pop()
+            if now - ts <= POOL_IDLE_TTL:
+                conn = cand
+                break
+            try:
+                cand.close()
+            except Exception:
+                pass
+        if not conns:
+            _conn_pool.pop(key, None)
+        return conn
+
+
+def _pool_put(key, conn):
+    """Return a still-good connection to the pool (or close it when full)."""
+    with _conn_pool_lock:
+        conns = _conn_pool.setdefault(key, [])
+        if len(conns) >= POOL_MAX_IDLE:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        conns.append((conn, time.time()))
+
+
+def _pooled_request(url, method="GET", headers=None, timeout=15,
+                    follow_redirects=True, max_redirects=8):
+    """Run one upstream request over a pooled connection.
+
+    Returns (status, headers, body, final_url), or None when the connection
+    itself failed (DNS/TLS/timeout), after retrying once on a fresh socket in
+    case a pooled one died server-side. HTTP error statuses come back
+    normally so callers can inspect them (a CF challenge is a 403). Redirects
+    are followed hop-by-hop through the pool, so a redirect chain costs at
+    most one handshake per origin.
+    """
+    req_headers = dict(headers or {})
+    # urllib used to send this implicitly; without it some servers gzip a body
+    # http.client would hand out undecoded.
+    if not any(k.lower() == "accept-encoding" for k in req_headers):
+        req_headers["Accept-Encoding"] = "identity"
+    current = url
+    for _ in range(max_redirects + 1):
+        p = urllib.parse.urlparse(current)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return None
+        host, port = p.hostname, p.port or (443 if p.scheme == "https" else 80)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        key = (p.scheme, host, port)
+
+        status, hdrs, body = None, None, None
+        for attempt in (0, 1):
+            pooled = _pool_get(key) if attempt == 0 else None
+            conn = pooled
+            if conn is None:
+                cls = (http.client.HTTPSConnection if p.scheme == "https"
+                       else http.client.HTTPConnection)
+                conn = cls(host, port, timeout=timeout)
+            try:
+                conn.request(method, path, headers=req_headers)
+                resp = conn.getresponse()
+                body = resp.read()     # drain fully so the socket stays usable
+                status, hdrs = resp.status, resp.msg
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if pooled is not None:
+                    continue           # stale pooled socket; retry once fresh
+                return None            # a brand-new connection failed: real error
+            if resp.will_close:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            else:
+                _pool_put(key, conn)
+            break
+        if status is None:
+            return None
+
+        location = hdrs.get("Location") if follow_redirects else None
+        if status in (301, 302, 303, 307, 308) and location:
+            current = urllib.parse.urljoin(current, location)
+            if status == 303:
+                method = "GET"
+            continue
+        return status, hdrs, body, current
+    return None
+
+
+def _decode_text(data):
+    """Try UTF-8, fall back to latin-1 (same as the old urllib fetchers)."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
 def fetch_url(url, referer=None, origin=None, timeout=10):
     """Fetch a URL and return the response body as string."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": _BROWSERS_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
@@ -665,17 +783,10 @@ def fetch_url(url, referer=None, origin=None, timeout=10):
         headers["Referer"] = referer
     if origin:
         headers["Origin"] = origin
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-            # Try UTF-8, fallback to latin-1
-            try:
-                return data.decode("utf-8")
-            except UnicodeDecodeError:
-                return data.decode("latin-1")
-    except Exception as e:
+    res = _pooled_request(url, headers=headers, timeout=timeout)
+    if res is None or not 200 <= res[0] < 300:
         return None
+    return _decode_text(res[2])
 
 
 def fetch_url_bytes(url, referer=None, timeout=10):
@@ -684,17 +795,15 @@ def fetch_url_bytes(url, referer=None, timeout=10):
     Used by the CDN proxy to serve binary assets (images, fonts) without
     corrupting them through text decoding."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": _BROWSERS_UA,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
         "Referer": referer or BASE_URL,
     }
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read(), resp.headers.get("Content-Type", "application/octet-stream")
-    except Exception:
+    res = _pooled_request(url, headers=headers, timeout=timeout)
+    if res is None or not 200 <= res[0] < 300:
         return None, None
+    return res[2], res[1].get("Content-Type", "application/octet-stream")
 
 
 def fetch_url_full(url, referer=None, timeout=20):
@@ -705,23 +814,69 @@ def fetch_url_full(url, referer=None, timeout=20):
     Returns (None, url) on failure.
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": _BROWSERS_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
     if referer:
         headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-            try:
-                body = data.decode("utf-8")
-            except UnicodeDecodeError:
-                body = data.decode("latin-1")
-            return body, resp.geturl()
-    except Exception:
+    res = _pooled_request(url, headers=headers, timeout=timeout)
+    if res is None or not 200 <= res[0] < 300:
         return None, url
+    return _decode_text(res[2]), res[3]
+
+
+# ── Upstream page cache ─────────────────────────────────────────────────────
+# /api/hosts and /api/parse both need the same video page (the UI fetches the
+# host list first, then the user picks one to parse). Hold successful page
+# fetches for ~30s so the hosts -> parse click sequence pays for one
+# round-trip instead of two. Failures and CF challenges are never cached.
+
+PAGE_CACHE_TTL = 30.0
+_PAGE_CACHE_MAX = 64
+_page_cache = {}          # (kind, key) -> (fetched_at, value)
+_page_cache_lock = threading.Lock()
+
+
+def _page_cache_get(kind, key):
+    now = time.time()
+    with _page_cache_lock:
+        item = _page_cache.get((kind, key))
+        if not item:
+            return None
+        if now - item[0] > PAGE_CACHE_TTL:
+            del _page_cache[(kind, key)]
+            return None
+        return item[1]
+
+
+def _page_cache_put(kind, key, value):
+    with _page_cache_lock:
+        while len(_page_cache) >= _PAGE_CACHE_MAX:
+            _page_cache.pop(next(iter(_page_cache)), None)
+        _page_cache[(kind, key)] = (time.time(), value)
+
+
+def _fetch_jav_page(page_url):
+    """Fetch a jav.guru video page through the shared page cache."""
+    cached = _page_cache_get("jav", page_url)
+    if cached is not None:
+        return cached
+    page_html = fetch_url(page_url, referer=BASE_URL)
+    if page_html:
+        _page_cache_put("jav", page_url, page_html)
+    return page_html
+
+
+def _fetch_supjav_page(path):
+    """Fetch a supjav video page through the shared page cache."""
+    cached = _page_cache_get("supjav", path)
+    if cached is not None:
+        return cached
+    res = fetch_supjav(path, referer=SUPJAV_BASE)
+    if res.get("ok") and res.get("body"):
+        _page_cache_put("supjav", path, res)
+    return res
 
 
 # ── supjav.com (Cloudflare-gated) support ────────────────────────────────────
@@ -786,18 +941,11 @@ def fetch_supjav(path, referer=None, timeout=20):
         headers["Cookie"] = cookie
     if referer:
         headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        status, hdrs, body, final_url = resp.getcode(), resp.headers, resp.read(), resp.geturl()
-    except urllib.error.HTTPError as e:
-        status, hdrs, body, final_url = e.code, e.headers, e.read(), url
-    except Exception:
+    res = _pooled_request(url, headers=headers, timeout=timeout)
+    if res is None:
         return {"ok": False, "status": 0, "challenge": False, "body": "", "final_url": url}
-    try:
-        text = body.decode("utf-8")
-    except UnicodeDecodeError:
-        text = body.decode("latin-1")
+    status, hdrs, body, final_url = res
+    text = _decode_text(body)
     challenge = _is_cf_challenge(status, hdrs, text)
     return {"ok": (not challenge and status == 200 and bool(text)),
             "status": status, "challenge": challenge, "body": text, "final_url": final_url}
@@ -1428,42 +1576,6 @@ def extract_jk(player_html, player_url):
     return {"url": f"{base}{suffix}?token={token}&expiry={expiry}", "kind": "mp4"}
 
 
-def extract_vo(player_html, player_url):
-    """VO (jamesbornmain.com / voe.sx).
-
-    The real stream URL is assembled by the external jwplayer.js (payload +
-    cookie + token), so the inline-script Node sandbox (vo_decode.js) cannot
-    reach it. A headless browser is required. Until that is added, VO is
-    reported as unsupported.
-    """
-    return None
-
-
-def _extract_vo_via_node(player_html, player_url):
-    """[disabled] Node vm-sandbox VO decoder. Kept for a future headless-browser
-    fallback; returns the decoded CDN URLs (ads) only, not the video."""
-    if not shutil.which("node"):
-        return None
-    try:
-        proc = subprocess.run(
-            ["node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vo_decode.js"), "-", player_url],
-            input=player_html,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=45, text=True,
-        )
-        if proc.returncode != 0:
-            return None
-        data = json.loads(proc.stdout)
-        url = data.get("file")
-        if not url:
-            return None
-        kind = "m3u8" if ".m3u8" in url else "mp4"
-        return {"url": url, "kind": kind, "title": data.get("title"),
-                "all_urls": data.get("urls", [])}
-    except Exception:
-        return None
-
-
 def _fetch_set_cookie(url, referer=None, timeout=15):
     """Fetch a page and return its Set-Cookie header (or None).
 
@@ -1473,14 +1585,10 @@ def _fetch_set_cookie(url, referer=None, timeout=15):
                "Accept-Language": "en-US,en;q=0.5"}
     if referer:
         headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.headers.get("Set-Cookie")
-    except urllib.error.HTTPError as e:
-        return e.headers.get("Set-Cookie")
-    except Exception:
+    res = _pooled_request(url, headers=headers, timeout=timeout)
+    if res is None:
         return None
+    return res[1].get("Set-Cookie")
 
 
 def _parse_st_botlink(html):
@@ -1523,15 +1631,12 @@ def extract_streamtape(player_html, player_url):
     if cookie:
         headers["Cookie"] = cookie
     for attempt in range(2):
-        req = urllib.request.Request(src, method="HEAD", headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-                final_url = resp.geturl()
-                if "video" in ctype or final_url.lower().endswith(".mp4"):
-                    return [{"url": final_url, "kind": "mp4"}]
-        except Exception:
-            pass
+        res = _pooled_request(src, method="HEAD", headers=headers, timeout=15)
+        if res is not None and 200 <= res[0] < 300:
+            ctype = (res[1].get("Content-Type") or "").split(";")[0].strip()
+            final_url = res[3]
+            if "video" in ctype or final_url.lower().endswith(".mp4"):
+                return [{"url": final_url, "kind": "mp4"}]
         if attempt == 0:
             time.sleep(2)
     return []
@@ -1637,98 +1742,6 @@ def playlist_duration(url, referer=None):
     return sum(durations), len(durations)
 
 
-def get_stream_info(m3u8_url):
-    """Fetch m3u8 and extract resolution, duration, segment count."""
-    content = fetch_url(m3u8_url)
-    if not content:
-        return {"error": "Failed to fetch m3u8"}
-
-    info = {
-        "url": m3u8_url,
-        "resolution": "Unknown",
-        "codec": "Unknown",
-        "duration": "Unknown",
-        "total_seconds": 0,
-        "segments": 0,
-        "encrypted": False,
-        "size": "Unknown",
-    }
-
-    # Check if it's a master playlist
-    stream_match = re.search(r'#EXT-X-STREAM-INF:BANDWIDTH=(\d+),RESOLUTION=(\d+x\d+),CODECS="([^"]+)"', content)
-    if stream_match:
-        info["bandwidth"] = int(stream_match.group(1))
-        info["resolution"] = stream_match.group(2)
-        info["codec"] = stream_match.group(3)
-        # Follow the nested playlist
-        lines = content.strip().split("\n")
-        for i, line in enumerate(lines):
-            if line.strip() and not line.startswith("#") and i > 0:
-                nested_url = line.strip()
-                if not nested_url.startswith("http"):
-                    nested_url = urllib.parse.urljoin(m3u8_url, nested_url)
-                nested_content = fetch_url(nested_url)
-                if nested_content:
-                    content = nested_content
-                    m3u8_url = nested_url
-                break
-
-    # Parse segment durations
-    durations = [float(m) for m in re.findall(r'#EXTINF:([\d.]+)', content)]
-    if durations:
-        total = sum(durations)
-        info["segments"] = len(durations)
-        info["total_seconds"] = total
-        hours = int(total // 3600)
-        mins = int((total % 3600) // 60)
-        secs = int(total % 60)
-        info["duration"] = f"{hours}h {mins}m {secs}s"
-
-    # Check encryption
-    if '#EXT-X-KEY' in content:
-        info["encrypted"] = True
-
-    # Estimate file size from bandwidth
-    if "bandwidth" in info and info["total_seconds"] > 0:
-        bytes_est = info["bandwidth"] * info["total_seconds"] / 8
-        if bytes_est > 1048576:
-            info["size"] = f"~{bytes_est / 1048576:.1f} MB"
-        else:
-            info["size"] = f"~{bytes_est / 1024:.1f} KB"
-
-    # Try to get more accurate size by checking a few segment file sizes
-    seg_urls = re.findall(r'https?://[^\s"\'<>]+(?=\s|$)', content)
-    seg_urls = [u for u in seg_urls if not u.startswith("http") or ".m3u8" not in u]
-    seg_urls = [u for u in seg_urls if "tiktokcdn" in u or "turboviplay" in u or "turbosplayer" in u]
-
-    if seg_urls and info["total_seconds"] > 0:
-        # Sample a few segments
-        total_sample_size = 0
-        sampled = 0
-        for seg_url in seg_urls[:3]:
-            try:
-                req = urllib.request.Request(seg_url, method="HEAD", headers={
-                    "User-Agent": "Mozilla/5.0",
-                })
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    size = resp.headers.get("Content-Length")
-                    if size:
-                        total_sample_size += int(size)
-                        sampled += 1
-            except Exception:
-                pass
-
-        if sampled > 0:
-            avg_seg_size = total_sample_size / sampled
-            avg_seg_duration = sum(durations[:sampled]) / sampled if durations else 5
-            total_bytes = avg_seg_size * info["total_seconds"] / avg_seg_duration
-            if total_bytes > 1048576:
-                info["size"] = f"~{total_bytes / 1048576:.0f} MB (actual)"
-            info["avg_segment_bytes"] = int(avg_seg_size)
-
-    return info
-
-
 def get_mp4_info(mp4_url, referer=None):
     """HEAD a progressive MP4 (DoodStream/JK) and report size + content type."""
     info = {
@@ -1742,13 +1755,15 @@ def get_mp4_info(mp4_url, referer=None):
         "size": "Unknown",
     }
     try:
-        req = urllib.request.Request(mp4_url, method="HEAD", headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        res = _pooled_request(mp4_url, method="HEAD", timeout=15, headers={
+            "User-Agent": _BROWSERS_UA,
             **({"Referer": referer} if referer else {}),
         })
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            length = resp.headers.get("Content-Length")
-            ctype = resp.headers.get("Content-Type", "")
+        if res is None:
+            info["error"] = "Connection failed"
+        elif 200 <= res[0] < 300:
+            length = res[1].get("Content-Length")
+            ctype = res[1].get("Content-Type", "")
             if length:
                 b = int(length)
                 info["size"] = f"~{b / 1048576:.0f} MB"
@@ -1757,14 +1772,16 @@ def get_mp4_info(mp4_url, referer=None):
             # video (expired token, blocked IP). Reject before downloading.
             if ctype.startswith("image/") or ctype.startswith("text/"):
                 info["error"] = f"Stream URL returned {ctype}, not video (URL may be expired)"
+        else:
+            info["error"] = f"HTTP Error {res[0]}"
     except Exception as e:
         info["error"] = str(e)
     return info
 
 
 # Hosts we cannot decode yet. VO (jamesbornmain.com / voe.sx) assembles its
-# stream URL in an external jwplayer.js, so it needs a headless browser (see
-# extract_vo). Hidden from the host list until that is added.
+# stream URL in an external jwplayer.js, so it needs a headless browser.
+# Hidden from the host list until that is added.
 UNSUPPORTED_PROVIDERS = {"vo"}
 
 
@@ -1778,7 +1795,7 @@ def _provider_code(label):
 
 def list_page_hosts(page_url):
     """Return the hosts on a video page that we can actually parse."""
-    page_html = fetch_url(page_url, referer=BASE_URL)
+    page_html = _fetch_jav_page(page_url)
     if not page_html:
         return {"error": "Failed to fetch page"}
     streams = extract_base64_iframe_urls(page_html)
@@ -1794,7 +1811,7 @@ def extract_streams_from_page(page_url, provider=None):
     """Main extraction pipeline: given a jav.guru video page URL, extract streams.
 
     If `provider` (a host label) is given, only that host is resolved."""
-    page_html = fetch_url(page_url, referer=BASE_URL)
+    page_html = _fetch_jav_page(page_url)
     if not page_html:
         return {"error": "Failed to fetch page"}
 
@@ -1933,24 +1950,17 @@ def _get_redirect_location(url, referer=None, timeout=15):
     """Return (status, location) for a redirecting URL without following it.
 
     supjav's `supjav.php?c=` endpoint 302s to the provider embed; we want the
-    Location header, not the follow-on fetch. urllib raises HTTPError(302) when
-    a redirect handler returns None, which still carries the Location header."""
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            return None
+    Location header, not the follow-on fetch. Returns (0, None) on a
+    connection failure."""
     headers = {"User-Agent": _BROWSERS_UA, "Accept": "*/*",
                "Accept-Language": "en-US,en;q=0.5"}
     if referer:
         headers["Referer"] = referer
-    opener = urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        resp = opener.open(req, timeout=timeout)
-        return resp.getcode(), resp.headers.get("Location")
-    except urllib.error.HTTPError as e:
-        return e.code, e.headers.get("Location")
-    except Exception:
+    res = _pooled_request(url, headers=headers, timeout=timeout,
+                          follow_redirects=False)
+    if res is None:
         return 0, None
+    return res[0], res[1].get("Location")
 
 
 # ── supjav token handoff ─────────────────────────────────────────────────────
@@ -2060,7 +2070,7 @@ def extract_supjav_data_links(page_html):
 
 def list_supjav_hosts(page_path):
     """Return the parseable server buttons on a supjav video page."""
-    res = fetch_supjav(page_path, referer=SUPJAV_BASE)
+    res = _fetch_supjav_page(page_path)
     if res.get("challenge"):
         return {"error": "Cloudflare challenge — cookie expired", "hosts": []}
     if not res.get("ok") or not res.get("body"):
@@ -2145,7 +2155,7 @@ def extract_supjav_streams(page_path, provider=None):
             results = list(pool.map(lambda s: _extract_one_supjav_server(s, title), links))
         return {"title": title, "streams": results}
 
-    res = fetch_supjav(page_path, referer=SUPJAV_BASE)
+    res = _fetch_supjav_page(page_path)
     if res.get("challenge"):
         return {"error": "Cloudflare challenge — cookie expired"}
     if not res.get("ok") or not res.get("body"):
@@ -2336,9 +2346,9 @@ def _other_active_prefixes(dl_id):
 def run_download(dl_id, url, title, fresh=True, _attempt=1):
     """Download a stream URL.
 
-    Direct progressive MP4 (DD / cloudatacdn) is downloaded with curl, which
-    has a standard TLS fingerprint and sends proper browser headers.
-    HLS / DASH streams go through yt-dlp (fragment-parallel, remux, etc.).
+    Progressive MP4 goes through yt-dlp driving aria2c (segment-split, browser
+    headers); HLS goes through yt-dlp too, except the maxstream/oppainet-style
+    CDNs that gate segment fetches on Referer+Origin, which go through ffmpeg.
 
     fresh=True (new download) removes any stale partial from an earlier
     attempt with the same title; fresh=False (resume) keeps it so the
@@ -2496,7 +2506,7 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
     log_update(dl_id, status="error", finished=_now())
 
 
-# Retryable network failures seen in yt-dlp / ffmpeg / curl output.
+# Retryable network failures seen in yt-dlp / ffmpeg output.
 TRANSIENT_NET_RE = re.compile(
     r"Connection (refused|reset|aborted)|timed ?out|Temporary failure in name"
     r" resolution|Could not resolve host|HTTP Error (408|429|5\d\d)"
@@ -2505,16 +2515,6 @@ TRANSIENT_NET_RE = re.compile(
     re.I,
 )
 MAX_DL_ATTEMPTS = 3
-
-
-def _is_direct_mp4_url(url):
-    """True if the URL looks like a direct progressive MP4 (not m3u8/DASH)."""
-    lower = url.lower()
-    if ".m3u8" in lower:
-        return False
-    if "/master.m3u8" in lower or "/index.m3u8" in lower or ".mpd" in lower:
-        return False
-    return True
 
 
 def _needs_ffmpeg_hls(url):
@@ -2612,57 +2612,6 @@ _FFMPEG_NOISE_RE = re.compile(
     r"(Opening '.*' for reading|Starting connection attempt to"
     r"|Successfully connected to|Skip \('#EXT-X-.*'\))"
 )
-
-
-CURL_BIN = shutil.which("curl") or "curl"
-_BROWSERS_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
-
-def _download_file_curl(dl_id, url, output_path, referer=None):
-    """Download a direct MP4 using curl.
-
-    curl has better TLS handling than yt-dlp's generic extractor and sends
-    browser-like headers by default.  Returns (returncode, last_output_lines).
-    """
-    cmd = [
-        CURL_BIN,
-        "-L",                        # follow redirects
-        "-k",                        # ignore TLS errors (--insecure)
-        "-o", output_path,
-        "-H", f"User-Agent: {_BROWSERS_UA}",
-        "-H", "Accept: video/mp4,*/*;q=0.9",
-        "-H", "Accept-Language: en-US,en;q=0.5",
-        "--connect-timeout", "20",
-        "--max-time", "3600",         # 1 h hard limit
-        "--retry", "2",
-        "--retry-delay", "5",
-        "--retry-all-errors",
-        "-f",                        # fail silently on HTTP errors
-    ]
-    if referer:
-        cmd += ["-H", f"Referer: {referer}"]
-    cmd.append(url)
-
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
-    )
-    with download_lock:
-        download_procs[dl_id] = proc
-
-    lines = []
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            lines.append(line)
-            with download_lock:
-                downloads[dl_id]["progress"] = line
-
-    proc.wait()
-    return proc.returncode, lines
 
 
 def _run_ytdlp_once(dl_id, cmd):
@@ -2795,6 +2744,28 @@ def _finish_download(dl_id, base, code):
 
 # ── Downloads page ──────────────────────────────────────────────────────────
 
+def storage_stats():
+    """Folder size of DOWNLOAD_DIR + disk capacity of the volume holding it."""
+    dir_used = 0
+    for _root, _dirs, files in os.walk(DOWNLOAD_DIR):
+        for name in files:
+            try:
+                dir_used += os.path.getsize(os.path.join(_root, name))
+            except OSError:
+                pass
+    try:
+        du = shutil.disk_usage(DOWNLOAD_DIR)
+        disk_total, disk_used, disk_free = du.total, du.used, du.free
+    except OSError:
+        disk_total = disk_used = disk_free = 0
+    return {
+        "dir_used": dir_used,
+        "disk_total": disk_total,
+        "disk_used": disk_used,
+        "disk_free": disk_free,
+    }
+
+
 def render_log_page():
     with log_lock:
         entries = list(reversed(_load_log()))
@@ -2887,10 +2858,13 @@ button.del:hover { background:#6b2121; }
 .title { color:#ccc; }
 .provider { color:#aaa; font-size:12px; white-space:nowrap; }
 .hint { color:#555; font-size:11px; margin-top:12px; }
+#disk { color:#888; font-size:12px; margin:-8px 0 14px 0; }
+#disk b { color:#aaa; font-weight:normal; }
 </style>
 </head>
 <body>
 <h1>Downloads <a href="/log">Log</a></h1>
+<div id="disk">Loading disk stats&hellip;</div>
 <table>
 <thead><tr><th>Title</th><th>Provider</th><th>Source</th><th>Status</th><th>Progress</th><th></th></tr></thead>
 <tbody id="rows"></tbody>
@@ -2898,6 +2872,13 @@ button.del:hover { background:#6b2121; }
 <div class="hint">Auto-refreshes every 2s. Completed files can be saved at any time, even after a server restart.</div>
 <script>
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+function fmtBytes(n) {
+  if (!n || n < 1) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return (n / Math.pow(1024, i)).toFixed(i ? 1 : 0) + ' ' + u[i];
+}
 
 async function cancelDl(btn) {
   btn.disabled = true;
@@ -2926,8 +2907,21 @@ async function deleteDl(btn) {
 
 async function refresh() {
   try {
-    const resp = await fetch('/api/downloads');
+    const [resp, sresp] = await Promise.all([
+      fetch('/api/downloads'),
+      fetch('/api/storage')
+    ]);
     const data = await resp.json();
+    if (sresp.ok) {
+      const s = await sresp.json();
+      const disk = document.getElementById('disk');
+      if (s.disk_total) {
+        disk.innerHTML = 'Downloads folder: <b>' + fmtBytes(s.dir_used) + '</b>' +
+          ' &middot; Free: <b>' + fmtBytes(s.disk_free) + '</b> / ' + fmtBytes(s.disk_total);
+      } else {
+        disk.textContent = 'Downloads folder: ' + fmtBytes(s.dir_used);
+      }
+    }
     const rows = document.getElementById('rows');
     const ids = Object.keys(data).sort((a, b) => b - a);
     rows.innerHTML = '';
@@ -3120,6 +3114,11 @@ body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; p
 # ── HTTP Handler ────────────────────────────────────────────────────────────
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    # HTTP/1.1 + Content-Length on every response lets the browser keep the
+    # connection alive, so the 1-2s UI polls don't re-connect (and the
+    # handlers don't re-parse a request line) on every tick.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format, *args):
         """Log errors but suppress routine access logs."""
         msg = format % args
@@ -3177,6 +3176,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             loc = self._supjav_token_landing(payload["page_url"])
             self.send_response(302)
             self.send_header("Location", loc)
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
 
@@ -3409,6 +3409,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, result)
             return
 
+        # ── API: Disk usage (downloads folder + free system space) ──
+        if path == "/api/storage":
+            self.send_json(200, storage_stats())
+            return
+
         # ── Downloads monitoring page ──
         if path == "/downloads":
             body = DOWNLOADS_PAGE.encode("utf-8")
@@ -3526,7 +3531,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             content = strip_ads_from_html(content, real_url)
 
             # Inject parse button on video pages
-            content = inject_parse_button(content, real_url)
+            content = inject_parse_button(content)
 
             # Inject a floating nav (Downloads + supjav) on every page.
             content = self._inject_nav_badge(content)
@@ -3549,6 +3554,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", content_type_header)
+        self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -3770,6 +3776,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
