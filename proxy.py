@@ -2863,7 +2863,7 @@ button.del:hover { background:#6b2121; }
 </style>
 </head>
 <body>
-<h1>Downloads <a href="/log">Log</a></h1>
+<h1>Downloads <a href="/player">Player</a> <a href="/log">Log</a></h1>
 <div id="disk">Loading disk stats&hellip;</div>
 <table>
 <thead><tr><th>Title</th><th>Provider</th><th>Source</th><th>Status</th><th>Progress</th><th></th></tr></thead>
@@ -2987,7 +2987,7 @@ def render_player_library():
             "size": os.path.getsize(d["file"]),
             "filename": os.path.basename(d["file"]),
         })
-    videos.sort(key=lambda v: v["title"])
+    videos.sort(key=lambda v: int(v["id"]), reverse=True)
 
     rows = []
     for v in videos:
