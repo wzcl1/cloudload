@@ -57,6 +57,10 @@ SUPJAV_PREFIX = "/supjav"
 SUPJAV_PLAYER_HOSTS = ([h.strip() for h in os.environ.get("SUPJAV_PLAYER_HOSTS", "").split(",") if h.strip()]
                        or ["lk1.supremejav.com"])
 
+# ── javgg.net (Cloudflare CDN but no challenge — direct proxy) ─────────────────
+JAVGG_BASE = "https://javgg.net"
+JAVGG_PREFIX = "/javgg"
+
 
 def _supjav_log(msg):
     """Trace the supjav resolution chain to stderr (visible in `docker logs`).
@@ -239,7 +243,14 @@ def strip_ads_from_html(html_content, page_url=""):
     """Remove ads, popups, and tracking from HTML content."""
     # Remove ad-related script tags
     html_content = re.sub(
-        r'<script[^>]*src=["\'][^"\']*(?:popunder|adsbygoogle|ad\.|propellerads|exoclick|pemsrv|tsyndicate|ad-maven|juicyads|trafficjunky|cloudflareinsights|yandex\.ru|mc\.yandex)[^"\']*["\'][^>]*>.*?</script>',
+        r'<script[^>]*src=["\'][^"\']*(?:popunder|adsbygoogle|ad\.|propellerads|exoclick|pemsrv|tsyndicate|ad-maven|juicyads|trafficjunky|cloudflareinsights|yandex\.ru|mc\.yandex|magsrv|ad-provider)[^"\']*["\'][^>]*>.*?</script>',
+        '', html_content, flags=re.DOTALL | re.IGNORECASE
+    )
+
+    # Remove ad loader scripts marked with data-spot / data-subidN attrs
+    # (rotating ad domains, e.g. javgg.net's *.shop / magsrv loaders).
+    html_content = re.sub(
+        r'<script[^>]*(?:data-spot=|data-subid\d=)[^>]*>.*?</script>',
         '', html_content, flags=re.DOTALL | re.IGNORECASE
     )
 
@@ -607,9 +618,11 @@ async function cancelDownload(id, btn, cancelBtn) {
 def inject_parse_button(html_content):
     """Inject a 'Parse Video Streams' button into video pages."""
     # Only inject on pages that have stream buttons (jav.guru: wp-btn-iframe;
-    # supjav: btn-server / data-link server buttons).
+    # supjav: btn-server / data-link server buttons; javgg: dooplay_player_option).
     has_supjav_player = ('btn-server' in html_content) or ('data-link=' in html_content)
-    if 'wp-btn-iframe' not in html_content and not has_supjav_player:
+    has_javgg_player = 'dooplay_player_option' in html_content
+    if ('wp-btn-iframe' not in html_content and not has_supjav_player
+            and not has_javgg_player):
         return html_content
 
     # Insert before </body>
@@ -636,6 +649,39 @@ def rewrite_urls(html_content, proxy_prefix):
     html_content = re.sub(
         r"""(href|src|action)=(['"])https?://cdn\.javnorth\.com""",
         lambda m: f'{m.group(1)}={m.group(2)}{proxy_prefix}/cdn/javnorth',
+        html_content
+    )
+    return html_content
+
+
+def rewrite_javgg_urls(html_content):
+    """Rewrite javgg.net page markup so it renders through the /javgg proxy.
+
+    - javgg.net absolute hrefs/srcs -> /javgg/...   (proxied page)
+    - external asset src=           -> /ext/<host>/...  (proxied asset)
+    - same-origin relative links    -> /javgg/... (never re-prefixing routes
+      that are already absolute proxy paths)
+    """
+    html_content = re.sub(
+        r"""(href|src|action)=(['"])https?://(?:www\.)?javgg\.net""",
+        lambda m: f'{m.group(1)}={m.group(2)}{JAVGG_PREFIX}',
+        html_content
+    )
+    html_content = re.sub(
+        r"""(src)=(['"])(?:https?:)?//([^'"]+)""",
+        lambda m: (
+            f'{m.group(1)}={m.group(2)}/ext/{m.group(3)}'
+            if m.group(3).split("/", 1)[0].split(":", 1)[0].lower()
+               not in ("javgg.net", "www.javgg.net")
+            else m.group(0)
+        ),
+        html_content
+    )
+    html_content = re.sub(
+        r"""(href|src|action)=(['"])(/[^'"]+)\2""",
+        lambda m: (m.group(0) if m.group(3).startswith(
+            (JAVGG_PREFIX, "/ext/", "/api/", "/cdn/", "/downloads", "/log", "/player"))
+            else f'{m.group(1)}={m.group(2)}{JAVGG_PREFIX}{m.group(3)}{m.group(2)}'),
         html_content
     )
     return html_content
@@ -872,6 +918,17 @@ def _fetch_jav_page(page_url):
     page_html = fetch_url(page_url, referer=BASE_URL)
     if page_html:
         _page_cache_put("jav", page_url, page_html)
+    return page_html
+
+
+def _fetch_javgg_page(page_url):
+    """Fetch a javgg.net page through the shared page cache."""
+    cached = _page_cache_get("javgg", page_url)
+    if cached is not None:
+        return cached
+    page_html = fetch_url(page_url, referer=JAVGG_BASE)
+    if page_html:
+        _page_cache_put("javgg", page_url, page_html)
     return page_html
 
 
@@ -1762,6 +1819,81 @@ def extract_streams_from_page(page_url, provider=None):
     return {"title": title, "streams": results}
 
 
+# ── javgg.net stream extraction ─────────────────────────────────────────────
+# dooplay-theme pages render the provider iframes server-side in plain HTML
+# (#source-player-N), so there is no base64 handoff — just pair each iframe
+# with its tab label and hand the embed URL to the shared extractors.
+
+def extract_javgg_sources(page_html):
+    """Pair each dooplay source-player iframe with its tab label.
+
+    Returns [{"label": "VH", "embed_url": "https://..."}] in page order."""
+    labels = {}
+    for m in re.finditer(
+            r"<li[^>]*id=['\"]player-option-(\d+)[^>]*>.*?"
+            r"<span[^>]*class=['\"]server['\"][^>]*>([^<]*)</span>",
+            page_html, re.DOTALL):
+        labels[m.group(1)] = m.group(2).strip() or f"S{m.group(1)}"
+    out = []
+    for m in re.finditer(
+            r"<div[^>]*id=['\"]source-player-(\d+)[^>]*>.{0,800}?"
+            r"<iframe[^>]*src=['\"]([^'\"]+)['\"]",
+            page_html, re.DOTALL):
+        num, src = m.group(1), m.group(2)
+        out.append({"label": labels.get(num, f"S{num}"), "embed_url": src})
+    return out
+
+
+def list_javgg_hosts(page_path):
+    """Return the parseable server iframes on a javgg.net video page."""
+    page_html = _fetch_javgg_page(JAVGG_BASE + page_path)
+    if not page_html:
+        return {"error": "Failed to fetch page"}
+    sources = extract_javgg_sources(page_html)
+    return {"hosts": [{"label": s["label"], "var": s["embed_url"]} for s in sources]}
+
+
+def _extract_one_javgg_server(source, page_url, title):
+    """Fetch one provider embed page and extract its stream URLs."""
+    label = source["label"]
+    embed_url = source["embed_url"]
+    # Some providers (e.g. earnvid) are slow from the VPS — allow a longer
+    # fetch than the 20s default.
+    player_html, final_url = fetch_url_full(embed_url, referer=page_url, timeout=60)
+    if not player_html:
+        return {"provider": label, "error": "Failed to fetch embed page",
+                "embed_url": embed_url}
+    got_list = extract_stream_url(player_html, final_url)
+    if not got_list:
+        return {"provider": label, "error": "No stream URL found",
+                "embed_url": embed_url}
+    return _build_stream_result(label, got_list, final_url, title)
+
+
+def extract_javgg_streams(page_path, provider=None):
+    """Resolve provider embeds on a javgg.net video page to stream URLs.
+
+    page_path is the path under JAVGG_BASE (e.g. '/jav/092226-001-carib/').
+    provider, when given, is a server label (VH/TB/LU/PL) to restrict to."""
+    page_url = JAVGG_BASE + page_path
+    page_html = _fetch_javgg_page(page_url)
+    if not page_html:
+        return {"error": "Failed to fetch page"}
+    m = re.search(r"<title>([^<]+)</title>", page_html)
+    title = re.sub(r"[^\w\s\-]", "", (m.group(1).strip() if m else "video"))[:80].strip()
+    sources = extract_javgg_sources(page_html)
+    if provider is not None:
+        sources = [s for s in sources if s["label"].lower() == provider.lower()]
+        if not sources:
+            return {"error": f"Server '{provider}' not found on this page", "title": title}
+    if not sources:
+        return {"error": "No server iframes found on this page", "title": title}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        results = list(pool.map(
+            lambda s: _extract_one_javgg_server(s, page_url, title), sources))
+    return {"title": title, "streams": results}
+
+
 def _extract_one_provider(stream, page_url, title):
     """Resolve a single provider's stream URL + info. Returns a result dict."""
     provider = stream["label"]
@@ -2100,9 +2232,14 @@ def find_stream_for_resume(page_url, provider, resolution):
     if not page_url:
         return None
     # page_url is usually the proxy URL (window.location.href); convert it back
-    # to the upstream URL, same as /api/parse does (jav.guru or supjav).
+    # to the upstream URL, same as /api/parse does (jav.guru, javgg or supjav).
     p = urllib.parse.urlparse(page_url)
-    if p.path == SUPJAV_PREFIX or p.path.startswith(SUPJAV_PREFIX + "/"):
+    if p.path == JAVGG_PREFIX or p.path.startswith(JAVGG_PREFIX + "/"):
+        javgg_path = p.path[len(JAVGG_PREFIX):] or "/"
+        if p.query:
+            javgg_path += "?" + p.query
+        result = extract_javgg_streams(javgg_path, provider)
+    elif p.path == SUPJAV_PREFIX or p.path.startswith(SUPJAV_PREFIX + "/"):
         supjav_path = p.path[len(SUPJAV_PREFIX):] or "/"
         if p.query:
             supjav_path += "?" + p.query
@@ -3056,6 +3193,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return False
 
     # ── supjav.com (Cloudflare-gated) handlers ──
+    def _handle_javgg_page(self, path, query):
+        """Serve a javgg.net page through the proxy: ad-strip, inject the
+        parse button + nav badge, and rewrite links/assets to stay in-proxy."""
+        suffix = path[len(JAVGG_PREFIX):] or "/"
+        real_url = JAVGG_BASE + suffix
+        if query:
+            real_url += "?" + query
+        content = _fetch_javgg_page(real_url)
+        if not content:
+            self.send_error(502, "Failed to fetch upstream")
+            return
+        content = strip_ads_from_html(content, real_url)
+        content = inject_parse_button(content)
+        content = self._inject_nav_badge(content)
+        content = rewrite_javgg_urls(content)
+        body = content.encode("utf-8") if isinstance(content, str) else content
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_supjav(self, path, query):
         """Serve supjav.com control-panel pages.
 
@@ -3175,6 +3336,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             '<a href="/supjav" style="background:#0f3460;color:#fff;border:1px solid #2196f3;'
             'border-radius:16px;padding:6px 14px;font:bold 12px Arial,sans-serif;'
             'text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,.4);">supjav</a>'
+            '<a href="/javgg" style="background:#0f3460;color:#fff;border:1px solid #4caf50;'
+            'border-radius:16px;padding:6px 14px;font:bold 12px Arial,sans-serif;'
+            'text-decoration:none;box-shadow:0 4px 12px rgba(0,0,0,.4);">javgg</a>'
             '</div>'
         )
         if '</body>' in content:
@@ -3199,6 +3363,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             upstream_path = parsed_url.path
             if parsed_url.query:
                 upstream_path += "?" + parsed_url.query
+            if upstream_path == JAVGG_PREFIX or upstream_path.startswith(JAVGG_PREFIX + "/"):
+                javgg_path = upstream_path[len(JAVGG_PREFIX):] or "/"
+                self.send_json(200, list_javgg_hosts(javgg_path))
+                return
             if upstream_path == SUPJAV_PREFIX or upstream_path.startswith(SUPJAV_PREFIX + "/"):
                 self.send_json(400, {"error": "supjav needs the bookmarklet token handoff — "
                                             "open the video page and run the bookmarklet"})
@@ -3224,6 +3392,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if upstream_path == SUPJAV_PREFIX or upstream_path.startswith(SUPJAV_PREFIX + "/"):
                 supjav_path = upstream_path[len(SUPJAV_PREFIX):] or "/"
                 self.send_json(200, extract_supjav_streams(supjav_path, provider))
+                return
+            if upstream_path == JAVGG_PREFIX or upstream_path.startswith(JAVGG_PREFIX + "/"):
+                javgg_path = upstream_path[len(JAVGG_PREFIX):] or "/"
+                self.send_json(200, extract_javgg_streams(javgg_path, provider))
                 return
             url = BASE_URL + upstream_path
             result = extract_streams_from_page(url, provider)
@@ -3429,6 +3601,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # ── Generic external asset proxy (/ext/<host>/<path>) ──
         if path.startswith("/ext/"):
             self._handle_ext_asset(path, query)
+            return
+
+        # ── javgg.net pages (no CF challenge — proxied directly) ──
+        if path == JAVGG_PREFIX or path.startswith(JAVGG_PREFIX + "/"):
+            self._handle_javgg_page(path, query)
             return
 
         # ── Proxy jav.guru pages ──
