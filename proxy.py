@@ -1840,6 +1840,10 @@ def extract_javgg_sources(page_html):
             r"<iframe[^>]*src=['\"]([^'\"]+)['\"]",
             page_html, re.DOTALL):
         num, src = m.group(1), m.group(2)
+        # playmate.to uses an RC4-obfuscated player we don't extract —
+        # don't offer it as a server option.
+        if "playmate" in urllib.parse.urlparse(src).netloc.lower():
+            continue
         out.append({"label": labels.get(num, f"S{num}"), "embed_url": src})
     return out
 
