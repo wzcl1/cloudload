@@ -2802,7 +2802,7 @@ def _download_file_ffmpeg(dl_id, url, output_path, referer=None):
             times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
             if times:
                 h, mi, s = times[-1]
-                elapsed = int(h) * 3600 + int(mi) + float(s)
+                elapsed = int(h) * 3600 + int(mi) * 60 + float(s)
                 pct = f"{min(100.0, elapsed / total_sec * 100):.0f}%"
         with download_lock:
             downloads[dl_id]["progress"] = pct or line
