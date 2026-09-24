@@ -17,6 +17,7 @@ import hmac
 import http.client
 import http.server
 import json
+import mimetypes
 import os
 import random
 import re
@@ -701,14 +702,16 @@ def rewrite_javgg_urls(html_content):
 def strip_javgg_ads(html_content):
     """Remove javgg.net's monetization markup (generic strip_ads_from_html
     handles the ad <script> tags; this removes the link-farm bits)."""
-    # Nav menu items that point at external sites (sponsored links, Telegram, ...).
+    # List items whose link points at an external site (sponsored links,
+    # Telegram, link farms). Only truly foreign hosts — javgg's own links
+    # are still absolute here and get rewritten to /javgg later.
     html_content = re.sub(
-        r"<li(?=[^>]*>)(?:(?!</li>).)*?href=[\"'](?:https?:)?//[^\s\"']+\s*[\"'](?:(?!</li>).)*?</li>",
+        r"<li(?=[\s>])(?:(?!</li>).)*?href=[\"'](?:https?:)?//(?!(?:www\.)?javgg\.net)[^\s\"']+\s*[\"'](?:(?!</li>).)*?</li>",
         '', html_content, flags=re.DOTALL | re.IGNORECASE)
     # Footer "Partner Sites" link farm (all external <a> inside div.copy).
     def _clean_copy_div(m):
         seg = m.group(0)
-        seg = re.sub(r"<a [^>]*href=[\"']https?://[^\"']*[\"'][^>]*>.*?</a>\s*-?\s*",
+        seg = re.sub(r"<a [^>]*href=[\"']https?://(?!(?:www\.)?javgg\.net)[^\"']*[\"'][^>]*>.*?</a>\s*-?\s*",
                      '', seg, flags=re.DOTALL)
         return seg
     html_content = re.sub(r"<div class=[\"']copy[\"'][^>]*>.*?</div>",
@@ -719,7 +722,7 @@ def strip_javgg_ads(html_content):
         '', html_content, flags=re.DOTALL)
     # Remaining external <a> links inside sidebar widgets ("Buy Uncensored @ ...").
     def _clean_aside(m):
-        seg = re.sub(r"<a [^>]*href=[\"']https?://[^\"']*[\"'][^>]*>.*?</a>",
+        seg = re.sub(r"<a [^>]*href=[\"']https?://(?!(?:www\.)?javgg\.net)[^\"']*[\"'][^>]*>.*?</a>",
                      '', m.group(0), flags=re.DOTALL)
         return seg
     html_content = re.sub(r"<aside[^>]*>.*?</aside>",
@@ -3252,6 +3255,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         real_url = JAVGG_BASE + suffix
         if query:
             real_url += "?" + query
+        # Non-HTML assets must not go through the text-decoding page
+        # pipeline — that corrupts binaries (webp cover images, fonts).
+        ctype = mimetypes.guess_type(suffix)[0] or ""
+        if ctype and ctype not in ("text/html", "application/xhtml+xml"):
+            data, remote_ct = fetch_url_bytes(real_url, referer=JAVGG_BASE)
+            if data is None:
+                self.send_error(502, "Failed to fetch upstream")
+                return
+            if ctype.startswith("text/") or ctype in (
+                    "application/javascript", "application/json",
+                    "application/xml", "text/xml"):
+                data = rewrite_javgg_urls(_decode_text(data)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", remote_ct or ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         content = _fetch_javgg_page(real_url)
         if not content:
             self.send_error(502, "Failed to fetch upstream")
