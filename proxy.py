@@ -3387,11 +3387,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         real_url = f"https://{host}/{suffix}" + (f"?{query}" if query else "")
-        data, remote_ct = fetch_url_bytes(real_url, referer=SUPJAV_BASE)
+        data, remote_ct = fetch_url_bytes(real_url, referer=SUPJAV_BASE, timeout=60)
         if data is None:
             self.send_error(502)
             return
         content_type = remote_ct or "application/octet-stream"
+        # Player ad overlay neutralization: earnvid (and similar players)
+        # inject a full-screen, near-invisible div (z-index:2147483647,
+        # opacity:0.01) that opens an ad popup on ANY tap. Make it inert.
+        if content_type.startswith("text/html"):
+            data = data.replace(
+                b"position:fixed;inset:0px;z-index:2147483647;"
+                b"background:black;opacity:0.01;height:",
+                b"display:none;height:")
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
