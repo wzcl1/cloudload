@@ -50,11 +50,12 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # ── supjav.com (Cloudflare-gated) ────────────────────────────────────────────
 SUPJAV_BASE = "https://supjav.com"
 SUPJAV_PREFIX = "/supjav"
-CF_COOKIE_FILE = os.path.join(DOWNLOAD_DIR, "supjav_cf.json")
 # Entry host(s) for supjav's token->provider redirector (supjav.php). Each
 # server button's `data-link` token is reversed and sent as `?c=`; that 302s to
 # the real provider embed (turbovidhls / fc2stream / streamtape / voe.sx).
-SUPJAV_PLAYER_HOSTS = ["lk1.supremejav.com"]
+# Comma-separated override: SUPJAV_PLAYER_HOSTS="lk1.supremejav.com,lk2.supremejav.com"
+SUPJAV_PLAYER_HOSTS = ([h.strip() for h in os.environ.get("SUPJAV_PLAYER_HOSTS", "").split(",") if h.strip()]
+                       or ["lk1.supremejav.com"])
 
 
 def _supjav_log(msg):
@@ -481,14 +482,20 @@ async function parseHost(btn) {
         if (data.error) {
             throw new Error(data.error);
         }
+        if (!data.streams || !data.streams.length) {
+            throw new Error('No streams found for ' + label);
+        }
         const stream = data.streams[0];
         if (stream.error) {
-            throw new Error(stream.error);
+            throw new Error(stream.error + (stream.embed_url ? ' (' + stream.embed_url + ')' : ''));
         }
 
         status.textContent = 'Found ' + stream.formats.length + ' format(s) on ' + label + '.';
         let html = '<div style="background: #16213e; border-radius: 8px; padding: 12px; border: 1px solid #0f3460;">';
         html += '<div style="font-weight: bold; color: #e94560; margin-bottom: 6px;">' + esc(stream.provider) + '</div>';
+        if (stream.note) {
+            html += '<div style="color: #ff9800; font-size: 11px; margin-bottom: 6px;">' + esc(stream.note) + '</div>';
+        }
         for (const fmt of stream.formats) {
             html += formatRow(fmt, stream.provider);
         }
@@ -868,133 +875,6 @@ def _fetch_jav_page(page_url):
     return page_html
 
 
-def _fetch_supjav_page(path):
-    """Fetch a supjav video page through the shared page cache."""
-    cached = _page_cache_get("supjav", path)
-    if cached is not None:
-        return cached
-    res = fetch_supjav(path, referer=SUPJAV_BASE)
-    if res.get("ok") and res.get("body"):
-        _page_cache_put("supjav", path, res)
-    return res
-
-
-# ── supjav.com (Cloudflare-gated) support ────────────────────────────────────
-#
-# supjav.com sits behind a Cloudflare *managed* challenge, which plain HTTP
-# clients (urllib/curl) cannot pass. The normal path is token handoff: the
-# user's own browser clears the challenge on the video page and hands the
-# server tokens to /supjav/tokens. For the direct-fetch fallback
-# (fetch_supjav), an optionally stored cf_clearance cookie is attached if
-# CF_COOKIE_FILE exists; the cookie is bound to (public IP, User-Agent), so
-# it only works when the proxy and the browser that earned it share a
-# public IP.
-
-def load_cf_cookie():
-    """Read the stored cf_clearance cookie. Returns {cf_clearance, user_agent} or {}."""
-    try:
-        with open(CF_COOKIE_FILE) as f:
-            data = json.load(f)
-        if isinstance(data, dict) and data.get("cf_clearance"):
-            return data
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def _cf_cookie_and_ua():
-    """Return (Cookie header value or None, user-agent or None)."""
-    data = load_cf_cookie()
-    if not data.get("cf_clearance"):
-        return None, None
-    return f"cf_clearance={data['cf_clearance']}", (data.get("user_agent") or None)
-
-
-def _is_cf_challenge(status, headers, text):
-    """True if the response is a Cloudflare interstitial (not real content)."""
-    if headers.get("cf-mitigated", "").lower() == "challenge":
-        return True
-    if status in (403, 503) and "Just a moment" in text and "challenges.cloudflare.com" in text:
-        return True
-    return False
-
-
-def fetch_supjav(path, referer=None, timeout=20):
-    """Fetch a supjav.com URL, attaching the stored cf_clearance cookie.
-
-    Follows redirects and captures 4xx/5xx (a CF challenge is a 403) so we can
-    detect it. Returns a dict:
-      ok        True if a real (non-challenge) page was fetched
-      status    HTTP status code (0 on transport error)
-      challenge True if the response was a Cloudflare challenge page
-      body      response body as str ("" on transport error)
-      final_url URL after redirects
-    """
-    url = SUPJAV_BASE + path
-    cookie, ua = _cf_cookie_and_ua()
-    headers = {
-        "User-Agent": ua or _BROWSERS_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-    if referer:
-        headers["Referer"] = referer
-    res = _pooled_request(url, headers=headers, timeout=timeout)
-    if res is None:
-        return {"ok": False, "status": 0, "challenge": False, "body": "", "final_url": url}
-    status, hdrs, body, final_url = res
-    text = _decode_text(body)
-    challenge = _is_cf_challenge(status, hdrs, text)
-    return {"ok": (not challenge and status == 200 and bool(text)),
-            "status": status, "challenge": challenge, "body": text, "final_url": final_url}
-
-
-def _rewrite_supjav_urls(content):
-    """Rewrite supjav.com page markup so it renders through the proxy.
-
-    - supjav.com absolute hrefs  -> /supjav/...   (proxied page)
-    - external asset src=        -> /ext/<host>/...  (proxied asset)
-    """
-    content = re.sub(
-        r"""(href|action)=(['"])https?://(?:www\.)?supjav\.com""",
-        lambda m: f'{m.group(1)}={m.group(2)}{SUPJAV_PREFIX}',
-        content
-    )
-    # Proxy external assets (images/css/js/fonts/video) so the page renders
-    # without the browser hitting Cloudflare-gated origins directly. Matches
-    # both absolute (https://host) and protocol-relative (//host) URLs.
-    content = re.sub(
-        r"""(src)=(['"])(?:https?:)?//([^/'"]+)""",
-        lambda m: (f'{m.group(1)}={m.group(2)}/ext/{m.group(3)}'
-                   if m.group(3).lower() not in ("supjav.com", "www.supjav.com")
-                   else m.group(0)),
-        content
-    )
-    return content
-
-
-def rewrite_supjav_page(content, page_url=""):
-    """Ad-strip a supjav.com page and rewrite its links/assets for the proxy.
-
-    - supjav.com absolute links -> /supjav/...
-    - external assets (src=)    -> /ext/<host>/...
-    - same-origin relative links -> /supjav/... (never re-prefixing routes that
-      are already absolute proxy paths)
-    """
-    content = strip_ads_from_html(content, page_url)
-    content = _rewrite_supjav_urls(content)
-    content = re.sub(
-        r"""(href|src|action)=(['"])(/[^'"]+)\2""",
-        lambda m: (m.group(0) if m.group(3).startswith(
-            ("/supjav", "/ext/", "/api/", "/cdn/", "/downloads", "/log", "/player"))
-            else f'{m.group(1)}={m.group(2)}{SUPJAV_PREFIX}{m.group(3)}{m.group(2)}'),
-        content
-    )
-    return content
-
-
 # ── supjav wrapper page (iframe viewing + token handoff) ─────────────────────
 # Served for every /supjav/... request. The user's browser loads supjav.com
 # itself inside the iframe (Cloudflare is cleared in the user's browser, not on
@@ -1071,6 +951,7 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
   var hostsEl = document.getElementById('hosts');
   var fmtsEl = document.getElementById('fmts');
   var openTab = document.getElementById('opentab');
+  var PAGE = __PAGE__;
   var lastTs = 0;
 
   function esc(s) {
@@ -1129,11 +1010,13 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (data.error) { throw new Error(data.error); }
+        if (!data.streams || !data.streams.length) { throw new Error('No streams found for ' + label); }
         var stream = data.streams[0];
         if (stream.error) { throw new Error(stream.error + (stream.embed_url ? ' (' + stream.embed_url + ')' : '')); }
         statusEl.textContent = 'Found ' + stream.formats.length + ' format(s) on ' + label + '.';
         var h = '<div style="background: #16213e; border-radius: 8px; padding: 10px; border: 1px solid #0f3460;">';
         h += '<div style="font-weight: bold; color: #e94560; margin-bottom: 6px;">' + esc(stream.provider) + '</div>';
+        if (stream.note) { h += '<div style="color: #ff9800; font-size: 11px; margin-bottom: 6px;">' + esc(stream.note) + '</div>'; }
         stream.formats.forEach(function(f) { h += formatRow(f, stream.provider); });
         h += '</div>';
         fmtsEl.innerHTML = h;
@@ -1213,7 +1096,7 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
 
   // Poll the token-handoff state; render server rows when tokens arrive.
   function tick() {
-    fetch('/api/supjav/tokens')
+    fetch('/api/supjav/tokens?page=' + encodeURIComponent(PAGE))
       .then(function(r) { return r.json(); })
       .then(function(d) {
         if (d.received) {
@@ -1396,16 +1279,37 @@ def _resolve(base_url, url):
 
 
 def extract_tv(player_html, player_url):
-    """TV (turboviplay.com): plain `var urlPlay='...m3u8'`."""
+    """TV (turboviplay.com / turbovidhls): a `var urlPlay='...m3u8'` assignment,
+    a JWPlayer `sources`/`file` config, a `data-hash` attribute, an `atob(...)`
+    obfuscated URL, or a bare m3u8 URL in the page. Returns the first (most
+    specific) candidate stream URL, in priority order."""
+    candidates = []
     m = re.search(r"var\s+urlPlay\s*=\s*['\"]([^'\"]+)['\"]", player_html)
     if m:
-        return {"url": _resolve(player_url, m.group(1)), "kind": "m3u8"}
+        candidates.append(m.group(1))
     m = re.search(r'data-hash="([^"]+\.m3u8[^"]*)"', player_html)
     if m:
-        return {"url": _resolve(player_url, m.group(1)), "kind": "m3u8"}
-    m = re.search(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', player_html)
-    if m:
-        return {"url": m.group(0), "kind": "m3u8"}
+        candidates.append(m.group(1))
+    # JWPlayer `sources:[{file:"..."}]` and bare `file:"...m3u8"` (newer TV embeds).
+    for m in re.finditer(r'\bsources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', player_html):
+        candidates.append(m.group(1))
+    for m in re.finditer(r'\bfile\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', player_html):
+        candidates.append(m.group(1))
+    # base64 `atob("...")` -> m3u8 (some TV builds obfuscate the stream URL).
+    for m in re.finditer(r'atob\(\s*["\']([A-Za-z0-9+/=]+)["\']\s*\)', player_html):
+        try:
+            dec = base64.b64decode(m.group(1)).decode("utf-8").strip()
+        except Exception:
+            continue
+        if ".m3u8" in dec:
+            candidates.append(dec)
+    # Bare absolute m3u8 URL anywhere in the page (last resort).
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', player_html):
+        candidates.append(m.group(0))
+    for cand in candidates:
+        cand = cand.strip()
+        if cand:
+            return {"url": _resolve(player_url, cand), "kind": "m3u8"}
     return None
 
 
@@ -1413,24 +1317,26 @@ def _extract_links_hls(js, player_url):
     """From SB's decoded `var links={hls2/hls3/hls4}` collect all m3u8 qualities.
 
     Returns a list of {"url","kind","label"} ordered best-first, or None."""
-    m = re.search(r'var\s+links\s*=\s*(\{[^}]*\})', js)
+    # Accept keys and values in double or single quotes (and unquoted keys),
+    # so both decoded eval output and raw page `var links={...}` are handled.
+    m = re.search(r'var\s+links\s*=\s*(\{[^}]*\})', js, re.S)
     if not m:
         return None
     obj = m.group(1)
     out = []
     seen = set()
     for key in ("hls2", "hls3", "hls4", "hls"):
-        km = re.search(r'"%s"\s*:\s*"([^"]+\.m3u8[^"]*)"' % re.escape(key), obj)
+        km = re.search(r'''["']?%s["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']''' % re.escape(key), obj)
         if km:
-            url = _resolve(player_url, km.group(1))
+            url = _resolve(player_url, km.group(1).strip())
             if url not in seen:
                 seen.add(url)
                 out.append({"url": url, "kind": "m3u8", "label": key})
     if out:
         return out
-    # Fallback: any .m3u8 values in the object
-    for km in re.finditer(r'"[^"]+"\s*:\s*"((?:https?://|/)[^"]+\.m3u8[^"]*)"', obj):
-        url = _resolve(player_url, km.group(1))
+    # Fallback: any .m3u8 value in the object (absolute or relative path).
+    for km in re.finditer(r'''["']?[^"':,{}]+["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']''', obj):
+        url = _resolve(player_url, km.group(1).strip())
         if url not in seen:
             seen.add(url)
             out.append({"url": url, "kind": "m3u8", "label": "hls"})
@@ -1588,7 +1494,11 @@ def _fetch_set_cookie(url, referer=None, timeout=15):
     res = _pooled_request(url, headers=headers, timeout=timeout)
     if res is None:
         return None
-    return res[1].get("Set-Cookie")
+    # A page may set several cookies; join their name=value pairs into a
+    # single Cookie header value.
+    cookies = res[1].get_all("Set-Cookie") if res[1].get_all else [res[1].get("Set-Cookie")]
+    cookies = [c.split(";", 1)[0] for c in cookies if c]
+    return "; ".join(cookies) if cookies else None
 
 
 def _parse_st_botlink(html):
@@ -1655,6 +1565,12 @@ def extract_stream_url(player_html, player_url):
     got = extract_tv(player_html, player_url)
     if got:
         return [got]
+
+    # 1b. SB-style `var links={hls2/hls3/hls4}` present directly in the page
+    #     (some SB/DD embeds skip the eval obfuscation).
+    got = _extract_links_hls(player_html, player_url)
+    if got:
+        return got
 
     # 2. JK (DoodStream / playmogo / vide0): /pass_md5/{hash}/{token} -> MP4.
     if "pass_md5" in player_html:
@@ -1827,6 +1743,12 @@ def extract_streams_from_page(page_url, provider=None):
         b64_streams = [s for s in b64_streams if s["label"].lower() == provider.lower()]
         if not b64_streams:
             return {"error": f"Host '{provider}' not found on this page", "title": title}
+    else:
+        # When resolving every provider, skip the ones we can't decode (e.g.
+        # VOE), the same way list_page_hosts does, so they don't just add a
+        # useless "No stream URL found" entry.
+        b64_streams = [s for s in b64_streams
+                       if _provider_code(s["label"]) not in UNSUPPORTED_PROVIDERS]
     if not b64_streams:
         return {"error": "No stream buttons found on this page", "title": title}
 
@@ -1969,34 +1891,61 @@ def _get_redirect_location(url, referer=None, timeout=15):
 # bookmarklet on the video page extracts the .btn-server[data-link] tokens and
 # hands them to the proxy via a short URL (/supjav/tokens?d=...). The
 # token -> 302 -> m3u8 chain is CF-free, so the server can resolve from there.
-supjav_tokens = {"servers": [], "title": "", "page_url": "", "ts": 0.0}
+# Tokens are stored per page (normalized path key) so multiple tabs/users
+# don't clobber each other; at most SUPJAV_TOKEN_MAX_PAGES pages are kept.
+supjav_tokens = {}  # page key -> {"servers", "title", "page_url", "ts"}
 supjav_tokens_lock = threading.Lock()
 SUPJAV_TOKEN_TTL = 1800  # data-link tokens are short-lived; 30-min safety cap
+SUPJAV_TOKEN_MAX_PAGES = 8
+
+
+def _norm_supjav_page(url_or_path):
+    """Normalized page path used as the token-store key (no scheme/host/query)."""
+    try:
+        path = urllib.parse.urlparse(url_or_path or "").path or "/"
+    except Exception:
+        path = "/"
+    if path == SUPJAV_PREFIX or path.startswith(SUPJAV_PREFIX + "/"):
+        path = path[len(SUPJAV_PREFIX):] or "/"
+    return path
 
 
 def store_supjav_tokens(title, page_url, servers):
+    key = _norm_supjav_page(page_url)
+    entry = {"servers": servers, "title": title, "page_url": page_url, "ts": time.time()}
     with supjav_tokens_lock:
-        supjav_tokens["servers"] = servers
-        supjav_tokens["title"] = title
-        supjav_tokens["page_url"] = page_url
-        supjav_tokens["ts"] = time.time()
+        now = time.time()
+        for k in [k for k, v in supjav_tokens.items() if now - v["ts"] > SUPJAV_TOKEN_TTL]:
+            del supjav_tokens[k]
+        if key not in supjav_tokens and len(supjav_tokens) >= SUPJAV_TOKEN_MAX_PAGES:
+            oldest = min(supjav_tokens, key=lambda k: supjav_tokens[k]["ts"])
+            del supjav_tokens[oldest]
+        supjav_tokens[key] = entry
     _supjav_log("tokens received: %d server(s) %s from %s"
                 % (len(servers), [s["label"] for s in servers], page_url or "?"))
 
 
-def get_supjav_tokens():
-    """Fresh stored tokens, or None if missing/older than the TTL."""
+def get_supjav_tokens(page_path=None):
+    """Fresh stored tokens for the given page (or the most recent entry if
+    page_path is None), or None if missing/older than the TTL."""
     with supjav_tokens_lock:
-        if not supjav_tokens["servers"]:
+        now = time.time()
+        items = [(k, v) for k, v in supjav_tokens.items()
+                 if v["servers"] and now - v["ts"] <= SUPJAV_TOKEN_TTL]
+        if not items:
             return None
-        age = time.time() - supjav_tokens["ts"]
-        if age > SUPJAV_TOKEN_TTL:
+        if page_path is not None:
+            key = _norm_supjav_page(page_path)
+            for k, v in items:
+                if k == key:
+                    age = now - v["ts"]
+                    return {"servers": list(v["servers"]), "title": v["title"],
+                            "page_url": v["page_url"], "ts": v["ts"], "age": age}
             return None
-        return {"servers": list(supjav_tokens["servers"]),
-                "title": supjav_tokens["title"],
-                "page_url": supjav_tokens["page_url"],
-                "ts": supjav_tokens["ts"],
-                "age": age}
+        k, v = max(items, key=lambda kv: kv[1]["ts"])
+        age = now - v["ts"]
+        return {"servers": list(v["servers"]), "title": v["title"],
+                "page_url": v["page_url"], "ts": v["ts"], "age": age}
 
 
 def decode_supjav_token_payload(d):
@@ -2004,10 +1953,10 @@ def decode_supjav_token_payload(d):
 
     Returns {"title", "page_url", "servers"} or None if the payload is bad.
     """
-    if not d:
+    if not d or len(d) > 8192:
         return None
     try:
-        raw = base64.urlsafe_b64decode(d + "=" * (-len(d) % 4))
+        raw = base64.b64decode(d + "=" * (-len(d) % 4), altchars=b"-_", validate=True)
         data = json.loads(raw)
     except Exception:
         return None
@@ -2044,41 +1993,6 @@ def resolve_supjav_embed(data_link):
             return loc.split("#")[0], entry
         _supjav_log(f"resolve {data_link[:12]}... via {host}: status={status} loc={loc!r}")
     return None, None
-
-
-def extract_supjav_data_links(page_html):
-    """Parse the `.btn-server[data-link]` server buttons from a supjav page."""
-    out, seen = [], set()
-    for tag in re.finditer(r"<a\b[^>]*>", page_html):
-        t = tag.group(0)
-        if "btn-server" not in t:
-            continue
-        dl = re.search(r'data-link="([^"]+)"', t)
-        if not dl:
-            continue
-        link = dl.group(1)
-        if link in seen:
-            continue
-        seen.add(link)
-        # Label is the text right after the opening '>' up to the closing tag.
-        rest = page_html[tag.end():tag.end() + 300]
-        label_m = re.match(r"^(.*?)</a>", rest, re.DOTALL)
-        label = re.sub(r"<[^>]+>", "", label_m.group(1)).strip() if label_m else ""
-        out.append({"data_link": link, "label": label})
-    return out
-
-
-def list_supjav_hosts(page_path):
-    """Return the parseable server buttons on a supjav video page."""
-    res = _fetch_supjav_page(page_path)
-    if res.get("challenge"):
-        return {"error": "Cloudflare challenge — cookie expired", "hosts": []}
-    if not res.get("ok") or not res.get("body"):
-        return {"error": f"Failed to fetch supjav page (status {res.get('status')})",
-                "hosts": []}
-    links = extract_supjav_data_links(res["body"])
-    hosts = [{"label": l["label"], "var": l["data_link"]} for l in links if l["label"]]
-    return {"hosts": hosts}
 
 
 def _extract_one_supjav_server(server, title):
@@ -2124,25 +2038,15 @@ def extract_supjav_streams(page_path, provider=None):
     page_path is the path under SUPJAV_BASE (e.g. '/459349.html'). provider,
     when given, is a server label (TV/FST/ST/VOE) to restrict to.
 
-    Token-handoff mode (preferred): if the user's browser recently sent this
-    page's server tokens, use them directly — the proxy never has to fetch
-    supjav.com itself (and so never has to pass Cloudflare)."""
-    tok = get_supjav_tokens()
+    Requires token handoff: the user's browser must have recently sent this
+    page's server tokens to /supjav/tokens — the proxy itself never fetches
+    supjav.com (and so never has to pass Cloudflare)."""
+    tok = get_supjav_tokens(page_path)
     if tok:
-        tp = urllib.parse.urlparse(tok["page_url"] or "")
-        tok_path = tp.path
-        if tok_path == SUPJAV_PREFIX or tok_path.startswith(SUPJAV_PREFIX + "/"):
-            tok_path = tok_path[len(SUPJAV_PREFIX):] or "/"
-        if tok_path != page_path.split("?", 1)[0]:
-            _supjav_log(f"token handoff page {tok['page_url'] or '?'} does not "
-                        f"match requested {page_path}; refetching")
-            tok = None
-    if tok:
+        _supjav_log(f"parse {page_path} via stored tokens (age {tok['age']:.0f}s, "
+                    f"from {tok['page_url'] or '?'}): {len(tok['servers'])} server(s)")
         title = re.sub(r"[^\w\s\-]", "", tok["title"])[:80].strip() or "video"
         links = [s for s in tok["servers"] if s.get("data_link")]
-        _supjav_log(f"parse {page_path} via token handoff (age {tok['age']:.0f}s, "
-                    f"from {tok['page_url'] or '?'}): {len(links)} server(s) "
-                    f"{[l['label'] for l in links]}")
         if provider is not None:
             links = [l for l in links if l["label"].lower() == provider.lower()]
             if not links:
@@ -2155,27 +2059,9 @@ def extract_supjav_streams(page_path, provider=None):
             results = list(pool.map(lambda s: _extract_one_supjav_server(s, title), links))
         return {"title": title, "streams": results}
 
-    res = _fetch_supjav_page(page_path)
-    if res.get("challenge"):
-        return {"error": "Cloudflare challenge — cookie expired"}
-    if not res.get("ok") or not res.get("body"):
-        return {"error": f"Failed to fetch supjav page (status {res.get('status')})"}
-    page_html = res["body"]
-    m = re.search(r"<title>([^<]+)</title>", page_html)
-    title = re.sub(r"[^\w\s\-]", "", (m.group(1).strip() if m else "video"))[:80].strip()
-    links = extract_supjav_data_links(page_html)
-    _supjav_log(f"parse {page_path} ({title[:40]!r}): {len(links)} server(s) "
-                f"{[l['label'] for l in links]}")
-    if provider is not None:
-        links = [l for l in links if l["label"].lower() == provider.lower()]
-        if not links:
-            return {"error": f"Server '{provider}' not found on this page",
-                    "title": title}
-    if not links:
-        return {"error": "No server buttons found on this page", "title": title}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(links)) as pool:
-        results = list(pool.map(lambda s: _extract_one_supjav_server(s, title), links))
-    return {"title": title, "streams": results}
+    _supjav_log(f"parse {page_path}: no stored tokens for this page")
+    return {"error": "No server tokens for this page yet — run the bookmarklet on "
+                    "the video page, then Parse again"}
 
 
 # ── Download management ─────────────────────────────────────────────────────
@@ -2404,7 +2290,12 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
                     pass
 
     current_url = url
-    use_ffmpeg = _needs_ffmpeg_hls(current_url)
+    # On retries after a yt-dlp failure, fall back to ffmpeg for any m3u8: it
+    # propagates Referer/Origin to every variant/segment fetch, which yt-dlp's
+    # generic extractor often misses (the main reason TV/SB HLS downloads
+    # fail with 403 even though the URL itself is fine).
+    use_ffmpeg = _needs_ffmpeg_hls(current_url) or (
+        _attempt > 1 and ".m3u8" in current_url.lower())
 
     with download_lock:
         if use_ffmpeg:
@@ -3206,7 +3097,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if query:
             suffix += "?" + query
         src = html.escape(SUPJAV_BASE + suffix, quote=True)
-        page = SUPJAV_WRAPPER_PAGE.replace("__SRC__", src)
+        page_path = suffix.split("?", 1)[0]
+        page = (SUPJAV_WRAPPER_PAGE.replace("__SRC__", src)
+                .replace("__PAGE__", json.dumps(page_path)))
         body = page.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3221,7 +3114,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """Wrapper URL for the page the tokens came from (fallback: supjav root)."""
         try:
             p = urllib.parse.urlparse(page_url)
-            if p.netloc.endswith("supjav.com") and p.path:
+            host = p.netloc.split(":", 1)[0].lower()
+            if (p.scheme in ("http", "https")
+                    and host in ("supjav.com", "www.supjav.com")
+                    and p.path.startswith("/")):
                 loc = SUPJAV_PREFIX + p.path
                 if p.query:
                     loc += "?" + p.query
@@ -3304,8 +3200,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if parsed_url.query:
                 upstream_path += "?" + parsed_url.query
             if upstream_path == SUPJAV_PREFIX or upstream_path.startswith(SUPJAV_PREFIX + "/"):
-                supjav_path = upstream_path[len(SUPJAV_PREFIX):] or "/"
-                self.send_json(200, list_supjav_hosts(supjav_path))
+                self.send_json(400, {"error": "supjav needs the bookmarklet token handoff — "
+                                            "open the video page and run the bookmarklet"})
                 return
             self.send_json(200, list_page_hosts(BASE_URL + upstream_path))
             return
@@ -3336,7 +3232,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # ── API: supjav token-handoff state (wrapper panel polls this) ──
         if path == "/api/supjav/tokens":
-            tok = get_supjav_tokens()
+            _q = urllib.parse.parse_qs(query)
+            page = _q.get("page", [None])[0]
+            tok = get_supjav_tokens(page)
             if tok:
                 self.send_json(200, {
                     "received": True,
