@@ -928,7 +928,13 @@ def fetch_url_bytes(url, referer=None, timeout=10):
     res = _pooled_request(url, headers=headers, timeout=timeout)
     if res is None or not 200 <= res[0] < 300:
         return None, None
-    return res[2], res[1].get("Content-Type", "application/octet-stream")
+    ctype = res[1].get("Content-Type", "application/octet-stream")
+    # Fail fast if upstream returns HTML (e.g. a Cloudflare challenge page or
+    # a soft-404 page with 200) — serving HTML as an image just corrupts
+    # the browser silently.
+    if ctype.lower().startswith("text/html"):
+        return None, None
+    return res[2], ctype
 
 
 def fetch_url_full(url, referer=None, timeout=20):
