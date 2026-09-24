@@ -696,6 +696,27 @@ def rewrite_javgg_urls(html_content):
     for variant in ("https:\\/\\/javgg.net", "http:\\/\\/javgg.net",
                     "https:\\/\\/www.javgg.net", "http:\\/\\/www.javgg.net"):
         html_content = html_content.replace(variant, "\\/javgg")
+    
+    # WP Rocket LazyLoad keeps the real image URLs in data-lazy-src /
+    # data-lazy-srcset while src holds a 1x1 SVG placeholder, and the
+    # rocket JS that swaps them in is a stale asset that 404s on the
+    # origin - so lazy images never load. Promote the lazy attributes
+    # to real src/srcset and drop the SVG placeholder srcs. (Quote-aware
+    # tag match: placeholders contain '>' inside the data URI.)
+    def _unlazy_img(m):
+        tag = m.group(0)
+        if "data-lazy-src" not in tag:
+            return tag
+        tag = re.sub(r'\ssrc="data:image/[^"]*"', "", tag)
+        tag = re.sub(r"\ssrc='data:image/[^']*'", "", tag)
+        tag = re.sub(r'\ssrcset="data:image/[^"]*"', "", tag)
+        tag = tag.replace('data-lazy-srcset="', 'srcset="')
+        tag = tag.replace('data-lazy-src="', 'src="')
+        return tag
+
+    html_content = re.sub(
+        r"<img\b(?:(?:[^<>\"]|\"[^\"]*\"|'[^']*')*)>",
+        _unlazy_img, html_content, flags=re.DOTALL)
     return html_content
 
 
