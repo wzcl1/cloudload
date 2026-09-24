@@ -3349,6 +3349,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Non-HTML assets must not go through the text-decoding page
         # pipeline — that corrupts binaries (webp cover images, fonts).
         ctype = mimetypes.guess_type(suffix)[0] or ""
+        if not ctype:
+            # Some Python builds' mimetypes db lacks .webp — without a
+            # recognized type the asset falls into the HTML pipeline and the
+            # binary gets decoded/re-encoded, corrupting it.
+            ext = suffix.rsplit(".", 1)[-1].lower() if "." in suffix else ""
+            ctype = {
+                "webp": "image/webp", "png": "image/png",
+                "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "gif": "image/gif", "svg": "image/svg+xml",
+                "ico": "image/x-icon", "bmp": "image/bmp",
+                "woff": "font/woff", "woff2": "font/woff2",
+                "css": "text/css", "js": "application/javascript",
+                "json": "application/json", "xml": "application/xml",
+            }.get(ext, "")
         if ctype and ctype not in ("text/html", "application/xhtml+xml"):
             data, remote_ct = fetch_url_bytes(real_url, referer=JAVGG_BASE)
             if data is None:
