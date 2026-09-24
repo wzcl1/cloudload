@@ -897,6 +897,55 @@ def _decode_text(data):
         return data.decode("latin-1")
 
 
+# ── Cloudflare burst-challenge throttle ──────────────────────────────────────
+# Cloudflare burst-scores datacenter IPs: a page load fires a dozen parallel
+# image requests at once, the IP gets challenged for a few seconds, and every
+# request in that window comes back as a challenge HTML page. Single requests
+# minutes apart pass fine. When a challenge is detected we hold upstream
+# fetches back (with jitter) until the window passes, then retry.
+_CF_LOCK = threading.Lock()
+_cf_block_until = 0.0
+
+
+def _cf_wait():
+    """Block until the Cloudflare cooldown window (if any) has passed.
+
+    Called before every upstream fetch: if another thread recently detected
+    a challenge, not-yet-started fetches hold back until the window clears."""
+    global _cf_block_until
+    while True:
+        with _CF_LOCK:
+            remaining = _cf_block_until - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 1.0) + random.uniform(0.0, 0.5))
+
+
+def _cf_mark_blocked(seconds=5.0):
+    """Record that Cloudflare is challenging the IP; back off for `seconds.
+
+    The retrying thread additionally sleeps a random 1-6s first, so a wave of
+    parallel retries doesn't land as one simultaneous burst that Cloudflare
+    would challenge again."""
+    global _cf_block_until
+    with _CF_LOCK:
+        _cf_block_until = max(_cf_block_until, time.monotonic() + seconds)
+    time.sleep(random.uniform(1.0, 6.0))
+
+
+def _is_cf_challenge_html(text):
+    """True when an HTML body is a Cloudflare challenge interstitial.
+
+    Note: real javgg pages also carry the CF precursor script injection
+    (challenge-platform / __CF$cv$params) even from clean IPs, so the
+    markers alone false-positive — interstitials are small, real pages are
+    not, hence the size gate."""
+    if len(text) > 60_000:
+        return False
+    return ("challenge-platform" in text or "__CF$cv$params" in text
+            or "Just a moment" in text or "Attention Required" in text)
+
+
 def fetch_url(url, referer=None, origin=None, timeout=10):
     """Fetch a URL and return the response body as string."""
     headers = {
@@ -908,10 +957,17 @@ def fetch_url(url, referer=None, origin=None, timeout=10):
         headers["Referer"] = referer
     if origin:
         headers["Origin"] = origin
+    _cf_wait()
     res = _pooled_request(url, headers=headers, timeout=timeout)
     if res is None or not 200 <= res[0] < 300:
         return None
-    return _decode_text(res[2])
+    body = _decode_text(res[2])
+    # A challenge interstitial arriving with 200 must not be mistaken for
+    # page content (it would sit in the page cache and be served as a page).
+    if _is_cf_challenge_html(body):
+        _cf_mark_blocked()
+        return None
+    return body
 
 
 def fetch_url_bytes(url, referer=None, timeout=10):
@@ -925,16 +981,24 @@ def fetch_url_bytes(url, referer=None, timeout=10):
         "Accept-Language": "en-US,en;q=0.5",
         "Referer": referer or BASE_URL,
     }
-    res = _pooled_request(url, headers=headers, timeout=timeout)
-    if res is None or not 200 <= res[0] < 300:
-        return None, None
-    ctype = res[1].get("Content-Type", "application/octet-stream")
-    # Fail fast if upstream returns HTML (e.g. a Cloudflare challenge page or
-    # a soft-404 page with 200) — serving HTML as an image just corrupts
-    # the browser silently.
-    if ctype.lower().startswith("text/html"):
-        return None, None
-    return res[2], ctype
+    for _ in range(2):
+        _cf_wait()
+        res = _pooled_request(url, headers=headers, timeout=timeout)
+        if res is None:
+            time.sleep(1.0)
+            continue
+        status, hdrs, body, _ = res
+        ctype = (hdrs.get("Content-Type") or "").lower()
+        # Upstream returned HTML for an asset request: a Cloudflare challenge
+        # page (or a soft-404 page with 200). Serving it as an image would
+        # corrupt the browser silently — back off and retry once instead.
+        if ctype.startswith("text/html") or status in (403, 429, 503):
+            _cf_mark_blocked()
+            continue
+        if not 200 <= status < 300:
+            return None, None
+        return body, hdrs.get("Content-Type") or "application/octet-stream"
+    return None, None
 
 
 def fetch_url_full(url, referer=None, timeout=20):
@@ -3713,7 +3777,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._handle_ext_asset(path, query)
             return
 
-        # ── javgg.net pages (no CF challenge — proxied directly) ──
+        # ── javgg.net pages (proxied directly; CF burst-challenges handled) ──
         if path == JAVGG_PREFIX or path.startswith(JAVGG_PREFIX + "/"):
             self._handle_javgg_page(path, query)
             return
