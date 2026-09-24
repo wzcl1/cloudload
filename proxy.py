@@ -684,6 +684,54 @@ def rewrite_javgg_urls(html_content):
             else f'{m.group(1)}={m.group(2)}{JAVGG_PREFIX}{m.group(3)}{m.group(2)}'),
         html_content
     )
+    # Everything else (srcset, JSON configs, CSS url(), meta tags, JS strings)
+    # still points at javgg.net — replace the scheme+host with the proxy
+    # prefix so the browser resolves those URLs through the proxy too
+    # (backslash-escaped \/ forms inside JS strings included).
+    for variant in ("https://javgg.net", "http://javgg.net",
+                    "https://www.javgg.net", "http://www.javgg.net",
+                    "//javgg.net", "//www.javgg.net"):
+        html_content = html_content.replace(variant, JAVGG_PREFIX)
+    for variant in ("https:\\/\\/javgg.net", "http:\\/\\/javgg.net",
+                    "https:\\/\\/www.javgg.net", "http:\\/\\/www.javgg.net"):
+        html_content = html_content.replace(variant, "\\/javgg")
+    return html_content
+
+
+def strip_javgg_ads(html_content):
+    """Remove javgg.net's monetization markup (generic strip_ads_from_html
+    handles the ad <script> tags; this removes the link-farm bits)."""
+    # Nav menu items that point at external sites (sponsored links, Telegram, ...).
+    html_content = re.sub(
+        r"<li(?=[^>]*>)(?:(?!</li>).)*?href=[\"'](?:https?:)?//[^\s\"']+\s*[\"'](?:(?!</li>).)*?</li>",
+        '', html_content, flags=re.DOTALL | re.IGNORECASE)
+    # Footer "Partner Sites" link farm (all external <a> inside div.copy).
+    def _clean_copy_div(m):
+        seg = m.group(0)
+        seg = re.sub(r"<a [^>]*href=[\"']https?://[^\"']*[\"'][^>]*>.*?</a>\s*-?\s*",
+                     '', seg, flags=re.DOTALL)
+        return seg
+    html_content = re.sub(r"<div class=[\"']copy[\"'][^>]*>.*?</div>",
+                          _clean_copy_div, html_content, flags=re.DOTALL)
+    # Ad-slot sidebar widgets (AdProvider <ins> placeholders + stub scripts).
+    html_content = re.sub(
+        r"<aside[^>]*>(?:(?!</aside>).)*?(?:data-zoneid|AdProvider)(?:(?!</aside>).)*?</aside>",
+        '', html_content, flags=re.DOTALL)
+    # Remaining external <a> links inside sidebar widgets ("Buy Uncensored @ ...").
+    def _clean_aside(m):
+        seg = re.sub(r"<a [^>]*href=[\"']https?://[^\"']*[\"'][^>]*>.*?</a>",
+                     '', m.group(0), flags=re.DOTALL)
+        return seg
+    html_content = re.sub(r"<aside[^>]*>.*?</aside>",
+                          _clean_aside, html_content, flags=re.DOTALL)
+    # DNS-prefetch / preconnect hints (leak ad domains, fire direct requests).
+    html_content = re.sub(
+        r"<link[^>]*rel=[\"'](?:dns-prefetch|preconnect)[\"'][^>]*/?>",
+        '', html_content, flags=re.IGNORECASE)
+    # Cloudflare-CH delegation meta for the ad provider (magsrv).
+    html_content = re.sub(
+        r"<meta http-equiv=[\"']Delegate-CH[\"'][^>]*/?>",
+        '', html_content, flags=re.IGNORECASE)
     return html_content
 
 
@@ -3208,6 +3256,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if not content:
             self.send_error(502, "Failed to fetch upstream")
             return
+        content = strip_javgg_ads(content)
         content = strip_ads_from_html(content, real_url)
         content = inject_parse_button(content)
         content = self._inject_nav_badge(content)
