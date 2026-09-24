@@ -349,6 +349,14 @@ PARSE_BUTTON_HTML = '''
       -webkit-overflow-scrolling: touch;
   }
   #javproxy-tools button { touch-action: manipulation; }
+  #javproxy-fab {
+      position: fixed; top: 10px; right: 10px; z-index: 1000000;
+      width: 44px; height: 44px; border-radius: 50%;
+      background: #e94560; color: #fff; border: none;
+      font-size: 18px; line-height: 1; cursor: pointer;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      display: none; touch-action: manipulation;
+  }
   @media (max-width: 600px) {
       #javproxy-tools {
           left: 10px; right: 10px; width: auto; min-width: 0;
@@ -374,6 +382,7 @@ PARSE_BUTTON_HTML = '''
       }
   }
   </style>
+  <button id="javproxy-fab" title="JavProxy tools" onclick="javproxySetPanel(true)">&#9654;</button>
   <div id="javproxy-tools" style="
      position: fixed; top: 10px; right: 10px; z-index: 999999;
      background: #1a1a2e; border: 2px solid #e94560; border-radius: 12px;
@@ -381,8 +390,12 @@ PARSE_BUTTON_HTML = '''
      box-shadow: 0 8px 32px rgba(0,0,0,0.5); min-width: 320px;
      touch-action: pan-y;
   ">
-    <h3 style="margin: 0 0 10px 0; color: #e94560; font-size: 16px;">
+    <h3 style="margin: 0 0 10px 0; color: #e94560; font-size: 16px;
+              display: flex; align-items: center; justify-content: space-between;">
         JavProxy Stream Tools
+        <button id="javproxy-close" onclick="javproxySetPanel(false)" title="Close"
+                style="background: none; border: none; color: #aaa; font-size: 18px;
+                       cursor: pointer; padding: 0 4px; line-height: 1;">&times;</button>
     </h3>
      <button id="parse-btn" onclick="parseStreams()" style="
         width: 100%; padding: 12px; background: #e94560; color: #fff;
@@ -398,6 +411,14 @@ PARSE_BUTTON_HTML = '''
 function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
+
+// Collapsible panel: on phones the fixed overlay blocks the page nav, so it
+// starts collapsed there (small icon button); tapping it expands the panel.
+function javproxySetPanel(open) {
+    document.getElementById('javproxy-tools').style.display = open ? 'block' : 'none';
+    document.getElementById('javproxy-fab').style.display = open ? 'none' : 'block';
+}
+javproxySetPanel(window.innerWidth > 600);
 
 // Keep touch scrolling inside the panel: when the panel hits its top/bottom
 // edge, cancel the gesture so the page underneath doesn't scroll. Needed on
@@ -2764,14 +2785,27 @@ def _download_file_ffmpeg(dl_id, url, output_path, referer=None):
     with download_lock:
         download_procs[dl_id] = proc
 
+    # Total stream duration (seconds), so the ffmpeg stats line can be shown
+    # as a simple percentage. 0 when the playlist can't be read (e.g. a
+    # master playlist) — then the raw stats line is shown instead.
+    total_sec, _segs = playlist_duration(url, referer=referer)
+
     lines = []
     for line in proc.stdout:
         line = line.strip()
         if not line or _FFMPEG_NOISE_RE.match(line):
             continue
         lines.append(line)
+        pct = ""
+        if total_sec:
+            # Stats chunks can hold several \r-updated readings; take the last.
+            times = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+            if times:
+                h, mi, s = times[-1]
+                elapsed = int(h) * 3600 + int(mi) + float(s)
+                pct = f"{min(100.0, elapsed / total_sec * 100):.0f}%"
         with download_lock:
-            downloads[dl_id]["progress"] = line
+            downloads[dl_id]["progress"] = pct or line
 
     proc.wait()
     return proc.returncode, lines
