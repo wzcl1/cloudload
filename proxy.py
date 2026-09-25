@@ -896,14 +896,19 @@ def _cf_mark_blocked(seconds=5.0):
 def _is_cf_challenge_html(text):
     """True when an HTML body is a Cloudflare challenge interstitial.
 
-    Note: real javgg pages also carry the CF precursor script injection
-    (challenge-platform / __CF$cv$params) even from clean IPs, so the
-    markers alone false-positive — interstitials are small, real pages are
-    not, hence the size gate."""
+    Must NOT match ordinary pages: Cloudflare injects a small script into
+    real 200 responses (/cdn-cgi/challenge-platform/scripts/jsd/main.js +
+    window.__CF$cv$params) on every proxied origin — including genuinely
+    small real pages such as jav.guru's /searcho/ handoff (~7KB).  Matching
+    those broad markers made every provider parse fail with "Failed to
+    fetch intermediate page".  Identify interstitials by their own
+    content instead; the size gate stays as a cheap fast-path (real
+    interstitials are always small)."""
     if len(text) > 60_000:
         return False
-    return ("challenge-platform" in text or "__CF$cv$params" in text
-            or "Just a moment" in text or "Attention Required" in text)
+    return ("Just a moment" in text or "Attention Required" in text
+            or "_cf_chl_opt" in text or "cf-browser-verification" in text
+            or "orchestrate/chl_page" in text)
 
 
 def fetch_url(url, referer=None, origin=None, timeout=10):
