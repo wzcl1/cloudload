@@ -2489,11 +2489,13 @@ def finalize_video(path, dl_id=None):
             os.replace(out, path)
             # DELETE may have fired in the window between its poll() and
             # terminate(): it removed the file and marked the download
-            # cancelled. Don't resurrect it under the cancel.
+            # cancelled. Don't resurrect it under the cancel. None means
+            # /api/file/ DELETE popped the entry — the file must not
+            # survive that either.
             if dl_id is not None:
                 with download_lock:
                     st = (downloads.get(dl_id) or {}).get("status")
-                if st == "cancelled":
+                if st in ("cancelled", None):
                     try:
                         os.remove(path)
                     except OSError:
@@ -4019,9 +4021,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             dl_id = path.split("/")[-1]
             with download_lock:
                 info = downloads.get(dl_id)
+                active = bool(info and info.get("status") in ("downloading", "queued"))
 
             if not info:
                 self.send_json(404, {"error": "Download not found"})
+                return
+            if not active:
+                # Already finished (or cancelled twice): don't kill procs or
+                # touch files — a completed file must survive a cancel that
+                # raced the finish.
+                self.send_json(200, {"status": info.get("status"), "id": dl_id})
                 return
 
             # Kill the subprocess if still running
@@ -4037,6 +4046,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
+            # Flip status under the lock FIRST — this is the linearization
+            # point for the cancel. Partial files may only be removed below
+            # if we actually transitioned to "cancelled": if the download
+            # finished in the gap, status/log say "done" and the completed
+            # file must stay on disk.
+            with download_lock:
+                info = downloads.get(dl_id)
+                cancelled = bool(info and info.get("status") in ("downloading", "queued"))
+                if cancelled:
+                    info["status"] = "cancelled"
+                    info["progress"] = "Cancelled by user"
+                download_procs.pop(dl_id, None)
+            if not cancelled:
+                self.send_json(200, {"status": (info or {}).get("status", "gone"), "id": dl_id})
+                return
+
             # Delete partial file + fragments from disk
             base = info.get("base") or re.sub(r'[^\w\s\-]', '', info.get("title", ""))[:80].strip()
             protect = _other_active_prefixes(dl_id)
@@ -4048,18 +4073,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         except OSError:
                             pass
 
-            with download_lock:
-                info = downloads.get(dl_id)
-                cancelled = bool(info and info.get("status") in ("downloading", "queued"))
-                if cancelled:
-                    info["status"] = "cancelled"
-                    info["progress"] = "Cancelled by user"
-                download_procs.pop(dl_id, None)
-            if cancelled:
-                # Same guard as the downloads write above: if the download
-                # finished in the gap, the log must not say "cancelled".
-                save_state()
-                log_update(dl_id, status="cancelled", finished=_now())
+            save_state()
+            log_update(dl_id, status="cancelled", finished=_now())
 
             self.send_json(200, {"status": "cancelled", "id": dl_id})
             return

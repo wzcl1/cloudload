@@ -22,6 +22,7 @@ RUN mkdir -p /app/downloads
 
 EXPOSE 8080
 
-# Port is taken from the LISTEN_PORT env var (see proxy.py); override by appending a port arg, e.g.:
+# Port defaults to 8080 (LISTEN_PORT in proxy.py); note proxy.py does NOT
+# read the LISTEN_PORT env var — override with a port arg, e.g.:
 #   docker run --rm cloudload-proxy:latest python proxy.py 9000
 CMD ["python", "proxy.py"]
