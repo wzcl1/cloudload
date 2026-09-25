@@ -11,7 +11,6 @@ RUN apt-get update \
         ffmpeg \
         aria2 \
         ca-certificates \
-        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # yt-dlp for downloading the resolved stream URLs.
@@ -23,4 +22,6 @@ RUN mkdir -p /app/downloads
 
 EXPOSE 8080
 
-CMD ["python", "proxy.py", "8080"]
+# Port is taken from the LISTEN_PORT env var (see proxy.py); override by appending a port arg, e.g.:
+#   docker run --rm cloudload-proxy:latest python proxy.py 9000
+CMD ["python", "proxy.py"]

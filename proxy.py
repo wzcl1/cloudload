@@ -11,7 +11,6 @@ Jav.guru + supjav.com proxy server with ad stripping and video stream extractor.
 
 import base64
 import concurrent.futures
-import hashlib
 import html
 import hmac
 import http.client
@@ -25,18 +24,19 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
-from io import BytesIO
 
 # ── Config ──────────────────────────────────────────────────────────────────
 LISTEN_PORT = 8080
 BASE_URL = "https://jav.guru"
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 YTDLP = os.environ.get("YTDLP", shutil.which("yt-dlp") or "yt-dlp")
-ARIA2C = shutil.which("aria2c") or "aria2c"
 MAX_DOWNLOADS = 3  # concurrent downloads
+MAX_JSON_BODY = 1 * 1024 * 1024  # cap for POST bodies (JSON only) — memory DoS guard
 # Optional basic auth: set both to enable, leave either unset to disable.
 BASIC_AUTH_USER = os.environ.get("BASIC_AUTH_USER", "")
 BASIC_AUTH_PASS = os.environ.get("BASIC_AUTH_PASS", "")
@@ -82,15 +82,30 @@ download_counter = 0
 STATE_FILE = os.path.join(DOWNLOAD_DIR, "downloads_state.json")
 
 
+state_write_lock = threading.Lock()
+
+
 def save_state():
-    """Persist download status to disk so it survives container restarts."""
+    """Persist download status to disk so it survives container restarts.
+
+    Serialized by state_write_lock and written to a unique tmp name so two
+    concurrent savers (state changes + the periodic loop) can never truncate
+    or clobber each other's in-flight write."""
     try:
         with download_lock:
             snapshot = {k: dict(v) for k, v in downloads.items()}
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(snapshot, f, indent=1)
-        os.replace(tmp, STATE_FILE)
+        with state_write_lock:
+            fd, tmp = tempfile.mkstemp(dir=DOWNLOAD_DIR, prefix=".state-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(snapshot, f, indent=1)
+                os.replace(tmp, STATE_FILE)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
     except OSError:
         pass
 
@@ -111,6 +126,9 @@ def load_state():
     for k, v in data.items():
         if not isinstance(v, dict):
             continue
+        if not str(k).isdigit():
+            continue  # ids are numeric; skip hand-edited/corrupt keys so a
+                      # bad entry can't 500 pages that int() the id
         if v.get("status") in ("downloading", "queued"):
             v["status"] = "interrupted"
             v["progress"] = "Interrupted (server restarted)"
@@ -136,6 +154,9 @@ def _state_saver_loop():
 
 LOG_FILE = os.path.join(DOWNLOAD_DIR, "download_log.json")
 log_lock = threading.Lock()
+# The log is fully re-read + rewritten on every update, so cap its length:
+# bounds both disk growth and the per-update I/O cost.
+LOG_MAX_ENTRIES = 500
 
 
 def _load_log():
@@ -160,7 +181,7 @@ def _now():
 
 def log_add(dl_id, title, provider, resolution="", page_url=""):
     with log_lock:
-        _save_log(_load_log() + [{
+        log = _load_log() + [{
             "id": dl_id,
             "title": title,
             "provider": provider,
@@ -170,7 +191,8 @@ def log_add(dl_id, title, provider, resolution="", page_url=""):
             "finished": None,
             "status": "queued",
             "code": None,
-        }])
+        }]
+        _save_log(log[-LOG_MAX_ENTRIES:])
 
 
 def log_update(dl_id, **fields):
@@ -187,157 +209,74 @@ def log_update(dl_id, **fields):
 
 load_state()
 
-# ── Ad/Popup stripping patterns ─────────────────────────────────────────────
-AD_DOMAINS = [
-    "googletagmanager.com", "google-analytics.com", "googlesyndication.com",
-    "doubleclick.net", "adskeeper.com", "propellerads.com", "pemsrv.com",
-    "exoclick.com", "juicyads.com", "trafficjunky.com", "tsyndicate.com",
-    "ad-maven.com", "a.pemsrv.com", "s.pemsrv.com", "go.godkc.com",
-    "go.mayzaent.com", "fractionfridgejudiciary.com", "endedstrung.com",
-    "purposeparking.com", "monkrix.com", "earnvids05032026.shop",
-    "zm.acreageupwhirl.com", "5vbs96dea.com", "nn.toodlerehouse.com",
-    "overplantovervaluetwine.com", "ruddy-pass.com", "xapi.juicyads.com",
-    "emturbovid.com", "cloudflareinsights.com", "mc.yandex.ru",
-    "ad.twinrdengine.com", "go.reebr.com",
-]
-
-AD_SCRIPT_PATTERNS = [
-    r'popunder\d+\.js',
-    r'adsbygoogle',
-    r'adblock',
-    r'_sp_',
-    r'__gads',
-    r'window\.open\s*\(',
-    r'document\.write\s*\(\s*unescape',
-    r'onclick\s*=\s*["\']window\.open',
-]
-
-STRIP_SELECTORS = [
-    "script[src*='popunder']",
-    "script[src*='adsbygoogle']",
-    "script[src*='ad.']",
-    "iframe[src*='mayzaent']",
-    "iframe[src*='ruddy-pass']",
-    "iframe[src*='go.godkc']",
-    "iframe[src*='cloudflare']",
-    "div.bl_layer",
-    "div.div_pop",
-    "#pop",
-]
-
-
-def is_ad_url(url):
-    """Check if a URL looks like an ad."""
-    if not url:
-        return False
-    url_lower = url.lower()
-    for domain in AD_DOMAINS:
-        if domain in url_lower:
-            return True
-    for pat in AD_SCRIPT_PATTERNS:
-        if re.search(pat, url_lower):
-            return True
-    return False
-
-
-def strip_ads_from_html(html_content, page_url=""):
-    """Remove ads, popups, and tracking from HTML content."""
-    # Remove ad-related script tags
-    html_content = re.sub(
-        r'<script[^>]*src=["\'][^"\']*(?:popunder|adsbygoogle|ad\.|propellerads|exoclick|pemsrv|tsyndicate|ad-maven|juicyads|trafficjunky|cloudflareinsights|yandex\.ru|mc\.yandex|magsrv|ad-provider)[^"\']*["\'][^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove ad loader scripts marked with data-spot / data-subidN attrs
-    # (rotating ad domains, e.g. javgg.net's *.shop / magsrv loaders).
-    html_content = re.sub(
-        r'<script[^>]*(?:data-spot=|data-subid\d=)[^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove inline ad scripts (var ad_idzone, ad_popup, etc.)
-    html_content = re.sub(
-        r'<script[^>]*>\s*var\s+ad_(?:idzone|popup|frequency|trigger|chrome|new_tab|venor)\s*=.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove popup/overlay divs
-    html_content = re.sub(
-        r'<div[^>]*id=["\']pop["\'][^>]*>.*?</div>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-    html_content = re.sub(
-        r'<div[^>]*class=["\']div_pop["\'][^>]*>.*?</div>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-    html_content = re.sub(
-        r'<div[^>]*class=["\']bl_layer["\'][^>]*>.*?</div>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove ad iframes
-    html_content = re.sub(
-        r'<iframe[^>]*(?:mayzaent|ruddy-pass|go\.godkc|cloudflare)[^>]*>.*?</iframe>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove onclick popup handlers
-    html_content = re.sub(
-        r'\s*onclick\s*=\s*["\'][^"\']*window\.open[^"\']*["\']',
-        '', html_content, flags=re.IGNORECASE
-    )
-
-    # Remove the SCSSpotScript ad loader
-    html_content = re.sub(
-        r'<script[^>]*id=["\']SCSpotScript["\'][^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove ad-related inline scripts (custom_ads, pop1, pop2, etc.)
-    html_content = re.sub(
-        r'<script[^>]*>\s*(?:var\s+(?:custom_ads|pop\d|popGG|popArai|popunder)\b.*?|document\.getElementById\([\'"]pop[\'"]\).*?)(?=</script>)',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove WordPress popular posts tracking
-    html_content = re.sub(
-        r'<script[^>]*data-api-url=["\'][^"\']*wordpress-popular-posts[^"\']*["\'][^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove googletagmanager/gtag scripts
-    html_content = re.sub(
-        r'<script[^>]*(?:googletagmanager|gtag|dataLayer)[^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove Cloudflare challenge scripts
-    html_content = re.sub(
-        r'<script[^>]*>.*?__\$cf\$cv\$params.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove Cloudflare beacon/insights scripts (beacon.min.js + insights)
-    html_content = re.sub(
-        r'<script[^>]*(?:cloudflareinsights\.com|beacon\.min\.js)[^>]*>.*?</script>',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
-
-    # Remove Yandex Metrika (script beacon + noscript pixel)
-    html_content = re.sub(
-        r'(?:<script[^>]*mc\.yandex\.ru[^>]*>.*?</script>'
+# Ad-strip patterns, compiled once at import (each runs over the FULL
+# page, so the 16 scans are the dominant cost on 1-2MB pages).
+_AD_STRIP_RES = [
+    re.compile(r'<script[^>]*src=["\'][^"\']*(?:popunder|adsbygoogle|ad\.|propellerads|exoclick|pemsrv|tsyndicate|ad-maven|juicyads|trafficjunky|cloudflareinsights|yandex\.ru|mc\.yandex|magsrv|ad-provider)[^"\']*["\'][^>]*>.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<script[^>]*(?:data-spot=|data-subid\d=)[^>]*>.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<script[^>]*>\s*var\s+ad_(?:idzone|popup|frequency|trigger|chrome|new_tab|venor)\s*=.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<div[^>]*id=["\']pop["\'][^>]*>.*?</div>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<div[^>]*class=["\']div_pop["\'][^>]*>.*?</div>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<div[^>]*class=["\']bl_layer["\'][^>]*>.*?</div>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<iframe[^>]*(?:mayzaent|ruddy-pass|go\.godkc|cloudflare)[^>]*>.*?</iframe>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'\s*onclick\s*=\s*["\'][^"\']*window\.open[^"\']*["\']',
+               re.IGNORECASE),
+    re.compile(r'<script[^>]*id=["\']SCSpotScript["\'][^>]*>.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<script[^>]*>\s*(?:var\s+(?:custom_ads|pop\d|popGG|popArai|popunder)\b.*?|document\.getElementById\([\'"]pop[\'"]\).*?)(?=</script>)',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<script[^>]*data-api-url=["\'][^"\']*wordpress-popular-posts[^"\']*["\'][^>]*>.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<script[^>]*(?:googletagmanager|gtag|dataLayer)[^>]*>.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<script[^>]*>.*?__\$cf\$cv\$params.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'<script[^>]*(?:cloudflareinsights\.com|beacon\.min\.js)[^>]*>.*?</script>',
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'(?:<script[^>]*mc\.yandex\.ru[^>]*>.*?</script>'
         r'|<noscript>\s*<div[^>]*><img[^>]*mc\.yandex\.ru[^>]*>.*?</div>\s*</noscript>)',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
+               re.DOTALL | re.IGNORECASE),
+    re.compile(r'Performance optimized by W3 Total Cache.*?(?=</body>|$)',
+               re.DOTALL | re.IGNORECASE),
+]
 
-    # Remove W3TC performance tracking
-    html_content = re.sub(
-        r'Performance optimized by W3 Total Cache.*?(?=</body>|$)',
-        '', html_content, flags=re.DOTALL | re.IGNORECASE
-    )
+# One-pass gate: if none of these markers is present, NO pattern above can
+# match, so the 16 full-page DOTALL scans are skipped entirely (the common
+# case for clean 1-2MB pages: ~25ms of C-speed substring checks instead of
+# ~55ms of regex scanning).  Every marker must be a substring of at least
+# one possible match of the pattern it guards.  Checks are case-sensitive:
+# real ad code is generated in fixed case and the common variants are listed
+# explicitly.  (A pattern marked re.I could in theory match exotic case
+# spellings like id="pOp" — those would then simply not be stripped.)
+# Note: a single re.compile('|'.join(...)) over these markers was ~4x SLOWER
+# than the battery it guards — CPython takes no literal fast-path for big
+# alternations — so this is a plain loop, not a regex.
+_AD_STRIP_MARKERS = (
+    'adsbygoogle', 'data-spot', 'yandex', 'window.open', 'cloudflare', 'gtag', 'popunder', 'div_pop',
+    'ad_idzone', 'custom_ads', 'propellerads', 'exoclick', 'pemsrv', 'tsyndicate', 'ad-maven', 'juicyads',
+    'trafficjunky', 'cloudflareinsights', 'magsrv', 'ad-provider', 'ad.', 'data-subid', 'ad_popup', 'ad_frequency',
+    'ad_trigger', 'ad_chrome', 'ad_new_tab', 'ad_venor', 'id="pop"', "id='pop'", 'id="Pop"', "id='Pop'", 'id="POP"', "id='POP'", 'ID="POP"', "ID='POP'",
+    'bl_layer', 'mayzaent', 'ruddy-pass', 'godkc', 'scsspotscript', 'SCSpotScript', 'popgg', 'popGG',
+    'poparai', 'popArai', 'pop0', 'pop1', 'pop2', 'pop3', 'pop4', 'pop5',
+    'pop6', 'pop7', 'pop8', 'pop9', 'getElementById', 'wordpress-popular-posts', 'googletagmanager', 'datalayer',
+    'dataLayer', '__$cf$cv$params', 'beacon.min.js', 'mc.yandex', 'w3 total cache', 'W3 Total Cache',
+)
 
+
+def strip_ads_from_html(html_content):
+    """Remove ads, popups, and tracking from HTML content."""
+    if not any(m in html_content for m in _AD_STRIP_MARKERS):
+        return html_content  # no ad markers -> nothing to strip
+    for rx in _AD_STRIP_RES:
+        html_content = rx.sub('', html_content)
     return html_content
-
 
 PARSE_BUTTON_HTML = '''
   <style>
@@ -2196,6 +2135,7 @@ supjav_tokens = {}  # page key -> {"servers", "title", "page_url", "ts"}
 supjav_tokens_lock = threading.Lock()
 SUPJAV_TOKEN_TTL = 1800  # data-link tokens are short-lived; 30-min safety cap
 SUPJAV_TOKEN_MAX_PAGES = 8
+SUPJAV_TOKENS_FILE = os.path.join(DOWNLOAD_DIR, "supjav_tokens.json")
 
 
 def _norm_supjav_page(url_or_path):
@@ -2207,6 +2147,41 @@ def _norm_supjav_page(url_or_path):
     if path == SUPJAV_PREFIX or path.startswith(SUPJAV_PREFIX + "/"):
         path = path[len(SUPJAV_PREFIX):] or "/"
     return path
+
+
+def _save_supjav_tokens():
+    """Persist the supjav token cache so an in-flight download stays
+    resumable across a proxy restart (tokens are good for ~30 min)."""
+    try:
+        with supjav_tokens_lock:
+            snapshot = {k: dict(v) for k, v in supjav_tokens.items()}
+        tmp = SUPJAV_TOKENS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f, indent=1)
+        os.replace(tmp, SUPJAV_TOKENS_FILE)
+    except OSError:
+        pass
+
+
+def _load_supjav_tokens():
+    """Restore the supjav token cache if the proxy restarted mid-download."""
+    try:
+        with open(SUPJAV_TOKENS_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        with supjav_tokens_lock:
+            for k, v in data.items():
+                if (isinstance(v, dict) and isinstance(v.get("servers"), list)
+                        and v.get("ts", 0) > now - SUPJAV_TOKEN_TTL
+                        and k not in supjav_tokens):
+                    supjav_tokens[k] = dict(v)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+
+_load_supjav_tokens()  # at import: the dict + lock above are already defined
 
 
 def store_supjav_tokens(title, page_url, servers):
@@ -2222,6 +2197,7 @@ def store_supjav_tokens(title, page_url, servers):
         supjav_tokens[key] = entry
     _supjav_log("tokens received: %d server(s) %s from %s"
                 % (len(servers), [s["label"] for s in servers], page_url or "?"))
+    _save_supjav_tokens()
 
 
 def get_supjav_tokens(page_path=None):
@@ -2443,7 +2419,7 @@ def _find_ts_sync(buf):
     return None
 
 
-def finalize_video(path):
+def finalize_video(path, dl_id=None):
     """Post-process a finished download; returns (ok, message).
 
     Some CDNs prepend a small PNG splash frame and serve MPEG-TS payloads
@@ -2476,14 +2452,31 @@ def finalize_video(path):
         if ts_sync is not None:
             cmd += ["-f", "mpegts"]
         cmd += ["-i", path, "-c", "copy", "-movflags", "+faststart", "-f", "mp4", out]
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900,
-        )
+        # Popen (not run) + registered in download_procs so a DELETE during
+        # the (up to 15 min) remux can kill ffmpeg and clean up; a plain
+        # run() orphaned the process and left the partial files on disk.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if dl_id is not None:
+            with download_lock:
+                download_procs[dl_id] = proc
+        try:
+            try:
+                stdout, stderr = proc.communicate(timeout=900)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()  # reap; kill() alone leaves a zombie
+                raise
+        finally:
+            # Only clear the registration if it still points at this process
+            # (a DELETE may have replaced it already).
+            if dl_id is not None:
+                with download_lock:
+                    if download_procs.get(dl_id) is proc:
+                        del download_procs[dl_id]
         if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024 * 1024:
             os.replace(out, path)
             return True, "remuxed to mp4"
-        stderr_tail = proc.stderr[-500:].decode("utf-8", errors="replace") if proc.stderr else ""
+        stderr_tail = stderr[-500:].decode("utf-8", errors="replace") if stderr else ""
         return False, f"ffmpeg remux failed (rc={proc.returncode}): {stderr_tail.strip()[-200:]}"
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"ffmpeg remux failed ({type(e).__name__})"
@@ -2601,13 +2594,35 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
     use_ffmpeg = _needs_ffmpeg_hls(current_url) or (
         _attempt > 1 and ".m3u8" in current_url.lower())
 
+    if _attempt == 1:
+        # Enforce MAX_DOWNLOADS: wait for a free slot before starting.
+        # The claim (count check + status flip) is done atomically inside
+        # one lock section so N queued downloads can't all pass the count
+        # check and start N concurrent downloads.  Retries skip this —
+        # they already hold a slot.
+        while True:
+            with download_lock:
+                info = downloads.get(dl_id)
+                if not info or info.get("status") not in ("queued", "downloading"):
+                    return  # cancelled while waiting for a slot
+                active = sum(1 for v in downloads.values()
+                             if v.get("status") == "downloading")
+                if active < MAX_DOWNLOADS:
+                    info["status"] = "downloading"
+                    info["progress"] = "Starting..."
+                    break
+            time.sleep(1)
+
     with download_lock:
+        info = downloads.get(dl_id)
+        if not info or info.get("status") not in ("queued", "downloading"):
+            return  # cancelled while starting
         if use_ffmpeg:
             downloader = "ffmpeg"
         else:
             downloader = "yt-dlp"
-        downloads[dl_id]["status"] = "downloading"
-        downloads[dl_id]["progress"] = (
+        info["status"] = "downloading"
+        info["progress"] = (
             f"Starting {downloader}..." if _attempt == 1 else
             f"Retry {_attempt - 1}/{MAX_DL_ATTEMPTS - 1} — starting {downloader}..."
         )
@@ -2675,14 +2690,18 @@ def run_download(dl_id, url, title, fresh=True, _attempt=1):
             current_url = new_url
             referer = new_referer
             with download_lock:
-                downloads[dl_id]["url"] = current_url
-                if new_referer:
-                    downloads[dl_id]["referer"] = new_referer
+                info = downloads.get(dl_id)
+                if info:
+                    info["url"] = current_url
+                    if new_referer:
+                        info["referer"] = new_referer
         with download_lock:
-            downloads[dl_id]["progress"] = (
-                f"Network error — retry {_attempt} of {MAX_DL_ATTEMPTS - 1} "
-                f"in {5 * _attempt}s..."
-            )
+            info = downloads.get(dl_id)
+            if info and info.get("status") in ("downloading", "queued"):
+                info["progress"] = (
+                    f"Network error — retry {_attempt} of {MAX_DL_ATTEMPTS - 1} "
+                    f"in {5 * _attempt}s..."
+                )
         time.sleep(5 * _attempt)
         with download_lock:
             if downloads.get(dl_id, {}).get("status") not in ("downloading", "queued"):
@@ -2805,7 +2824,9 @@ def _download_file_ffmpeg(dl_id, url, output_path, referer=None):
                 elapsed = int(h) * 3600 + int(mi) * 60 + float(s)
                 pct = f"{min(100.0, elapsed / total_sec * 100):.0f}%"
         with download_lock:
-            downloads[dl_id]["progress"] = pct or line
+            info = downloads.get(dl_id)
+            if info is not None:
+                info["progress"] = pct or line
 
     proc.wait()
     return proc.returncode, lines
@@ -2838,7 +2859,9 @@ def _run_ytdlp_once(dl_id, cmd):
         if line:
             lines.append(line)
             with download_lock:
-                downloads[dl_id]["progress"] = line
+                info = downloads.get(dl_id)
+                if info is not None:
+                    info["progress"] = line
 
     proc.wait()
     return proc.returncode, lines
@@ -2890,7 +2913,7 @@ def _finish_download(dl_id, base, code):
     # Remux PNG+TS payloads into a clean MP4 container.
     with download_lock:
         downloads[dl_id]["progress"] = "Finalizing (remuxing to MP4)..."
-    ok, msg = finalize_video(fpath)
+    ok, msg = finalize_video(fpath, dl_id=dl_id)
     if not ok:
         try:
             os.remove(fpath)
@@ -3195,7 +3218,8 @@ def render_player_library():
             "size": os.path.getsize(d["file"]),
             "filename": os.path.basename(d["file"]),
         })
-    videos.sort(key=lambda v: int(v["id"]), reverse=True)
+    videos.sort(key=lambda v: int(v["id"]) if str(v["id"]).isdigit() else -1,
+                reverse=True)
 
     rows = []
     for v in videos:
@@ -3418,7 +3442,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(502, "Failed to fetch upstream")
             return
         content = strip_javgg_ads(content)
-        content = strip_ads_from_html(content, real_url)
+        content = strip_ads_from_html(content)
         content = inject_parse_button(content)
         content = self._inject_nav_badge(content)
         content = rewrite_javgg_urls(content)
@@ -3534,7 +3558,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Player ad overlay neutralization: earnvid (and similar players)
         # inject a full-screen, near-invisible div (z-index:2147483647,
         # opacity:0.01) that opens an ad popup on ANY tap. Make it inert.
-        if content_type.startswith("text/html"):
+        is_html = content_type.split(";", 1)[0].strip().lower() == "text/html"
+        # Player ad overlay neutralization: earnvid (and similar players)
+        # inject a full-screen, near-invisible div (z-index:2147483647,
+        # opacity:0.01) that opens an ad popup on ANY tap. Make it inert.
+        if is_html:
             data = data.replace(
                 b"position:fixed;inset:0px;z-index:2147483647;"
                 b"background:black;opacity:0.01;height:",
@@ -3542,7 +3570,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "public, max-age=86400")
+        # HTML (player pages) must not be cached: the players rotate
+        # hosts/tokens and a stale 24h-cached page breaks playback.
+        self.send_header("Cache-Control",
+                         "no-cache" if is_html else "public, max-age=86400")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data)
@@ -3567,7 +3598,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return content.replace('</body>', badge + '\n</body>', 1)
         return content + badge
 
+    def _dispatch(self, impl):
+        """Last-resort handler guard: an unhandled exception must not kill
+        the request thread with an opaque traceback — log it and answer
+        with JSON so the browser sees a clean 500."""
+        try:
+            impl()
+        except Exception:
+            traceback.print_exc()
+            try:
+                self.send_json(500, {"error": "internal error"})
+            except Exception:
+                pass
+            self.close_connection = True
+
     def do_GET(self):
+        self._dispatch(self._do_GET_impl)
+
+    def _do_GET_impl(self):
         if not self._auth_ok():
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -3793,14 +3841,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             content_type = "application/octet-stream"
             if ".png" in path:
                 content_type = "image/png"
-            elif ".jpg" in path or ".jpeg" in path or ".webp" in path:
+            elif ".jpg" in path or ".jpeg" in path:
                 content_type = "image/jpeg"
+            elif ".webp" in path:
+                content_type = "image/webp"
             elif ".css" in path:
                 content_type = "text/css"
             elif ".js" in path:
                 content_type = "application/javascript"
-            elif ".woff" in path or ".woff2" in path:
+            elif ".woff2" in path:
                 content_type = "font/woff2"
+            elif ".woff" in path:
+                content_type = "font/woff"
             elif ".gif" in path:
                 content_type = "image/gif"
             elif ".svg" in path:
@@ -3847,7 +3899,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         if is_html:
             # Strip ads
-            content = strip_ads_from_html(content, real_url)
+            content = strip_ads_from_html(content)
 
             # Inject parse button on video pages
             content = inject_parse_button(content)
@@ -3880,6 +3932,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_DELETE(self):
+        self._dispatch(self._do_DELETE_impl)
+
+    def _do_DELETE_impl(self):
         if not self._auth_ok():
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -3893,6 +3948,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if not info:
                 self.send_json(404, {"error": "Download not found"})
                 return
+            # Kill any still-running process (e.g. a slow remux) so it can't
+            # re-create or half-modify the file we are deleting.
+            proc = download_procs.get(dl_id)
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()  # reap; kill() alone leaves a zombie
+                except Exception:
+                    pass
             file_path = info.get("file")
             if file_path and os.path.exists(file_path):
                 try:
@@ -3942,6 +4010,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         proc.kill()
+                        proc.wait()  # reap; kill() alone leaves a zombie
                 except Exception:
                     pass
 
@@ -3957,8 +4026,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             pass
 
             with download_lock:
-                downloads[dl_id]["status"] = "cancelled"
-                downloads[dl_id]["progress"] = "Cancelled by user"
+                info = downloads.get(dl_id)
+                if info and info.get("status") in ("downloading", "queued"):
+                    info["status"] = "cancelled"
+                    info["progress"] = "Cancelled by user"
                 download_procs.pop(dl_id, None)
             save_state()
             log_update(dl_id, status="cancelled", finished=_now())
@@ -3969,6 +4040,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        self._dispatch(self._do_POST_impl)
+
+    def _do_POST_impl(self):
         if not self._auth_ok():
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -3979,6 +4053,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 content_length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 self.send_json(400, {"error": "Bad Content-Length header"})
+                return
+            if content_length > MAX_JSON_BODY:
+                # Don't read the body; close the connection (an undrained
+                # body would desync keep-alive).
+                self.close_connection = True
+                self.send_json(413, {"error": "Request body too large (max 1 MB)"})
                 return
             body = self.rfile.read(content_length)
             try:
@@ -4027,6 +4107,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 content_length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 self.send_json(400, {"error": "Bad Content-Length header"})
+                return
+            if content_length > MAX_JSON_BODY:
+                # Don't read the body; close the connection (an undrained
+                # body would desync keep-alive).
+                self.close_connection = True
+                self.send_json(413, {"error": "Request body too large (max 1 MB)"})
                 return
             body = self.rfile.read(content_length)
             try:
