@@ -2136,6 +2136,7 @@ supjav_tokens_lock = threading.Lock()
 SUPJAV_TOKEN_TTL = 1800  # data-link tokens are short-lived; 30-min safety cap
 SUPJAV_TOKEN_MAX_PAGES = 8
 SUPJAV_TOKENS_FILE = os.path.join(DOWNLOAD_DIR, "supjav_tokens.json")
+supjav_tokens_write_lock = threading.Lock()
 
 
 def _norm_supjav_page(url_or_path):
@@ -2152,13 +2153,24 @@ def _norm_supjav_page(url_or_path):
 def _save_supjav_tokens():
     """Persist the supjav token cache so an in-flight download stays
     resumable across a proxy restart (tokens are good for ~30 min)."""
+    # Serialized by supjav_tokens_write_lock and written to a unique tmp
+    # name (same pattern as save_state) so concurrent savers can't clobber
+    # each other's in-flight write.
     try:
         with supjav_tokens_lock:
             snapshot = {k: dict(v) for k, v in supjav_tokens.items()}
-        tmp = SUPJAV_TOKENS_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(snapshot, f, indent=1)
-        os.replace(tmp, SUPJAV_TOKENS_FILE)
+        with supjav_tokens_write_lock:
+            fd, tmp = tempfile.mkstemp(dir=DOWNLOAD_DIR, prefix=".supjav-tokens-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(snapshot, f, indent=1)
+                os.replace(tmp, SUPJAV_TOKENS_FILE)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
     except OSError:
         pass
 
@@ -2475,6 +2487,17 @@ def finalize_video(path, dl_id=None):
                         del download_procs[dl_id]
         if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024 * 1024:
             os.replace(out, path)
+            # DELETE may have fired in the window between its poll() and
+            # terminate(): it removed the file and marked the download
+            # cancelled. Don't resurrect it under the cancel.
+            if dl_id is not None:
+                with download_lock:
+                    st = (downloads.get(dl_id) or {}).get("status")
+                if st == "cancelled":
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
             return True, "remuxed to mp4"
         stderr_tail = stderr[-500:].decode("utf-8", errors="replace") if stderr else ""
         return False, f"ffmpeg remux failed (rc={proc.returncode}): {stderr_tail.strip()[-200:]}"
@@ -4027,12 +4050,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             with download_lock:
                 info = downloads.get(dl_id)
-                if info and info.get("status") in ("downloading", "queued"):
+                cancelled = bool(info and info.get("status") in ("downloading", "queued"))
+                if cancelled:
                     info["status"] = "cancelled"
                     info["progress"] = "Cancelled by user"
                 download_procs.pop(dl_id, None)
-            save_state()
-            log_update(dl_id, status="cancelled", finished=_now())
+            if cancelled:
+                # Same guard as the downloads write above: if the download
+                # finished in the gap, the log must not say "cancelled".
+                save_state()
+                log_update(dl_id, status="cancelled", finished=_now())
 
             self.send_json(200, {"status": "cancelled", "id": dl_id})
             return
