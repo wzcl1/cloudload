@@ -591,6 +591,19 @@ def inject_parse_button(html_content):
     return html_content
 
 
+def rewrite_page_title(html_content):
+    """Give every page the proxy serves a generic tab title ("cloudload").
+
+    Applied at serve time only — the page cache and stream extraction must
+    keep the upstream <title>, which is used for download filenames.  Accepts
+    str or bytes."""
+    if isinstance(html_content, bytes):
+        return re.sub(rb"<title\b[^>]*>.*?</title>", b"<title>cloudload</title>",
+                      html_content, flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(r"<title\b[^>]*>.*?</title>", "<title>cloudload</title>",
+                  html_content, flags=re.IGNORECASE | re.DOTALL)
+
+
 def rewrite_urls(html_content, proxy_prefix):
     """Rewrite absolute URLs to go through the proxy.
 
@@ -1049,7 +1062,7 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>supjav — JavProxy</title>
+<title>cloudload</title>
 <style>
   html, body { margin: 0; min-height: 100%; background: #0f0f1a; font-family: Arial, sans-serif; }
   .wrap { max-width: 600px; margin: 0 auto; padding: 20px 14px 48px; }
@@ -1270,7 +1283,6 @@ SUPJAV_WRAPPER_PAGE = '''<!doctype html>
             statusEl.textContent = 'Tokens received: ' + d.servers.length + ' server(s)'
               + (d.page_url ? ' for ' + d.page_url : '')
               + ' (' + Math.round(d.age) + 's old)';
-            if (d.title) { document.title = d.title.slice(0, 60) + ' — JavProxy'; }
             if (d.page_url) { openTab.href = d.page_url; }
             hostsEl.innerHTML = '<div style="font-size: 12px; color: #aaa; margin: 6px 0;">Servers — pick one:</div>'
               + d.servers.map(function(s) { return hostRow(s.label); }).join('');
@@ -3061,7 +3073,7 @@ LOG_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Download Log - JavProxy</title>
+<title>cloudload</title>
 <style>
 body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:20px; }
 h1 { color:#e94560; font-size:20px; margin:0 0 16px 0; }
@@ -3098,7 +3110,7 @@ DOWNLOADS_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Downloads - JavProxy</title>
+<title>cloudload</title>
 <style>
 body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:20px; }
 h1 { color:#e94560; font-size:20px; margin:0 0 16px 0; }
@@ -3116,6 +3128,7 @@ button:hover, a.btn:hover { background:#16437e; }
 button.del { border-color:#ff6b6b; }
 button.del:hover { background:#6b2121; }
 .progress { color:#888; font-size:12px; max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.progress .size { color:#555; font-size:11px; }
 .title { color:#ccc; }
 .provider { color:#aaa; font-size:12px; white-space:nowrap; }
 .hint { color:#555; font-size:11px; margin-top:12px; }
@@ -3127,7 +3140,7 @@ button.del:hover { background:#6b2121; }
 <h1>Downloads <a href="/player">Player</a> <a href="/log">Log</a></h1>
 <div id="disk">Loading disk stats&hellip;</div>
 <table>
-<thead><tr><th>Title</th><th>Provider</th><th>Source</th><th>Status</th><th>Progress</th><th></th></tr></thead>
+<thead><tr><th>Title</th><th>Provider</th><th>Status</th><th>Progress</th><th></th></tr></thead>
 <tbody id="rows"></tbody>
 </table>
 <div class="hint">Auto-refreshes every 2s. Completed files can be saved at any time, even after a server restart.</div>
@@ -3187,7 +3200,7 @@ async function refresh() {
     const ids = Object.keys(data).sort((a, b) => b - a);
     rows.innerHTML = '';
     if (!ids.length) {
-      rows.innerHTML = '<tr><td colspan="6" style="color:#666">No downloads yet.</td></tr>';
+      rows.innerHTML = '<tr><td colspan="5" style="color:#666">No downloads yet.</td></tr>';
     }
     for (const id of ids) {
       const d = data[id];
@@ -3206,15 +3219,19 @@ async function refresh() {
       }
       const tr = document.createElement('tr');
       const detail = (d.status === 'error' && d.error) ? d.error : (d.progress || d.error || '');
-      const sourceHtml = d.page_url
-        ? '<a href="' + esc(d.page_url) + '" target="_blank" style="color:#2196f3;font-size:11px;text-decoration:none;" title="' + esc(d.page_url) + '">source</a>'
-        : '';
+      const titleText = esc(d.title || 'download ' + id);
+      const titleHtml = d.page_url
+        ? '<a href="' + esc(d.page_url) + '" target="_blank" style="color:#2196f3;text-decoration:none;" title="' + esc(d.page_url) + '">' + titleText + '</a>'
+        : titleText;
+      let progressHtml = esc(detail);
+      if (d.status === 'done' && d.size) {
+        progressHtml += '<div class="size">' + (d.size / (1024 ** 3)).toFixed(2) + ' GB</div>';
+      }
       tr.innerHTML =
-        '<td class="title">' + esc(d.title || 'download ' + id) + '</td>' +
+        '<td class="title">' + titleHtml + '</td>' +
         '<td class="provider">' + esc(d.provider || '') + '</td>' +
-        '<td>' + sourceHtml + '</td>' +
         '<td class="status ' + esc(d.status) + '">' + esc(d.status) + '</td>' +
-        '<td class="progress" title="' + esc(detail) + '">' + esc(detail) + '</td>' +
+        '<td class="progress" title="' + esc(detail) + '">' + progressHtml + '</td>' +
         '<td>' + actions + '</td>';
       rows.appendChild(tr);
     }
@@ -3290,7 +3307,7 @@ PLAYER_LIBRARY_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Player - JavProxy</title>
+<title>cloudload</title>
 <style>
 body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:20px; }
 h1 { color:#e94560; font-size:20px; margin:0 0 16px 0; }
@@ -3365,7 +3382,7 @@ PLAYER_VIDEO_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__TITLE__ - Player</title>
+<title>cloudload</title>
 <style>
 body { background:#0f0f1a; color:#eee; font-family:Arial,sans-serif; margin:0; padding:0; }
 .topbar {
@@ -3402,6 +3419,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # connection alive, so the 1-2s UI polls don't re-connect (and the
     # handlers don't re-parse a request line) on every tick.
     protocol_version = "HTTP/1.1"
+
+    # Stock http.server error pages would show "<code> <reason>" as the tab
+    # title — give them the same generic title as every other page.
+    error_message_format = """\
+<!DOCTYPE HTML>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <title>cloudload</title>
+    </head>
+    <body>
+        <h1>%(code)d %(message)s</h1>
+        <p>%(explain)s</p>
+    </body>
+</html>
+"""
 
     def log_message(self, format, *args):
         """Log errors but suppress routine access logs."""
@@ -3476,6 +3509,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         content = inject_parse_button(content)
         content = self._inject_nav_badge(content)
         content = rewrite_javgg_urls(content)
+        content = rewrite_page_title(content)
         body = content.encode("utf-8") if isinstance(content, str) else content
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3502,7 +3536,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(query)
             payload = decode_supjav_token_payload(params.get("d", [""])[0])
             if not payload:
-                body = (b"<html><head><title>Bad token</title></head>"
+                body = (b"<html><head><title>cloudload</title></head>"
                         b"<body style='background:#0f0f1a;color:#fff;font-family:Arial,sans-serif;padding:40px'>"
                         b"<h2>Bad or empty token payload</h2>"
                         b"<p>Run the snippet again on the video page and follow the link it prints.</p>"
@@ -3597,6 +3631,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 b"position:fixed;inset:0px;z-index:2147483647;"
                 b"background:black;opacity:0.01;height:",
                 b"display:none;height:")
+            data = rewrite_page_title(data)
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
@@ -3798,6 +3833,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     v.get("status") in ("interrupted", "error", "cancelled")
                     and bool(v.get("page_url"))
                 )
+                f = v.get("file")
+                try:
+                    v["size"] = os.path.getsize(f) if f else 0
+                except OSError:
+                    v["size"] = 0
             self.send_json(200, result)
             return
 
@@ -3949,6 +3989,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 lambda m: f'{m.group(1)}={m.group(2)}{proxy_prefix}{m.group(3)}{m.group(2)}',
                 content
             )
+
+            content = rewrite_page_title(content)
 
             if isinstance(content, str):
                 content = content.encode("utf-8")
